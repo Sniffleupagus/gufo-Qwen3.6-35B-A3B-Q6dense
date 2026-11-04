@@ -158,7 +158,7 @@ void RegisterBenchOptions(ArgParser& parser, BenchOptions& opt,
       });
 
   parser.AddOption("", "--mtp-model", "PATH",
-                   "Path to GGUF model containing MTP draft weights",
+                   "MTP draft weights GGUF (Qwen3.6 uses its native MTP)",
                    "Speculative", &opt.mtp_model_path);
 
   parser.AddOption("", "--dflash-model", "PATH",

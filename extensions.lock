@@ -7,6 +7,7 @@
     "qwen",
     "qwen3_asr",
     "qwen3_tts",
+    "qwen36_35b_a3b",
     "qwen38_flash_next",
     "qwen_image_21"
   ]
