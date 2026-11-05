@@ -300,6 +300,7 @@ public:
                 // start: one selection block (compress ratio).
                 .prefill_alignment =
                     std::max<std::size_t>(1, model_->config().compress_ratio),
+                .max_in_pass_checkpoints = rocm::kMaxPassCheckpoints,
             },
         .persistence = persistence_,
         .sampling_preset = sampling::TextModelPreset::kQwen38,
@@ -444,10 +445,10 @@ public:
     }
     const std::size_t remaining = prompt.size() - offset;
     const std::size_t consumed =
-        std::min<std::size_t>({max_input_tokens, remaining,
-                               remaining <= model_->PrefillThroughCapacity()
-                                   ? model_->PrefillThroughCapacity()
-                                   : model_->PrefillCapacity()});
+        StepTokens(offset, max_input_tokens, remaining,
+                   remaining <= model_->PrefillThroughCapacity()
+                       ? model_->PrefillThroughCapacity()
+                       : model_->PrefillCapacity());
     const std::size_t next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
     // The next step most likely takes the same budget; its n-gram rows are
@@ -479,45 +480,51 @@ public:
       std::size_t offset, std::size_t budget,
       std::size_t boundary) const override {
     const auto& qfn = RequireQwenFlashNextState(state);
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
-    if (boundary <= offset + 1 || boundary >= offset + consumed ||
-        offset + consumed - boundary > model_->PrefillCheckpointTail())
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
+    if (boundary <= offset + 1 || boundary >= offset + consumed)
       return std::nullopt;
     const auto bytes = qfn.session().PrefillCheckpointBytes(
         static_cast<std::uint32_t>(boundary));
     return bytes ? std::optional<std::size_t>(bytes) : std::nullopt;
   }
 
+  using TextModelRunner::PrefillThrough;
   [[nodiscard]] TextPrefillStep PrefillThrough(
       TextRunnerState& state, std::span<const TextRunnerToken> prompt,
-      std::size_t offset, std::size_t budget, std::size_t boundary,
-      std::unique_ptr<TextRunnerSnapshot>* checkpoint,
-      const std::function<std::unique_ptr<TextRunnerSnapshot>()>& capture)
-      const override {
+      std::size_t offset, std::size_t budget,
+      std::span<const std::size_t> boundaries,
+      const InPassConsumer& consume) const override {
     auto& qfn = RequireQwenFlashNextState(state);
-    if (!checkpoint || !capture || offset != qfn.position())
+    if (!consume || boundaries.empty() || offset != qfn.position())
       throw std::logic_error("invalid component in-pass checkpoint request");
-    const auto consumed = std::min<std::size_t>(
-        {budget, prompt.size() - offset, model_->PrefillThroughCapacity()});
+    const auto consumed = StepTokens(offset, budget, prompt.size() - offset,
+                                     model_->PrefillThroughCapacity());
     const auto next_position = offset + consumed;
     const auto prefix = QwenFlashNextEngineTokens(prompt.first(next_position));
+    // As in Prefill: the next step's n-gram rows are read during this one.
+    const auto rest = next_position == prompt.size()
+                          ? state.prefill_lookahead()
+                          : prompt.subspan(next_position);
+    const std::size_t after = rest.size();
+    const auto next = QwenFlashNextEngineTokens(rest.subspan(
+        0, std::min<std::size_t>({budget, after,
+                                  after <= model_->PrefillThroughCapacity()
+                                      ? model_->PrefillThroughCapacity()
+                                      : model_->PrefillCapacity()})));
+    std::vector<std::uint32_t> points(boundaries.begin(), boundaries.end());
     double capture_ms = 0;
     try {
       qfn.adapter().PrefillThrough(
-          qfn.slot(), prefix, static_cast<std::uint32_t>(boundary), [&] {
+          qfn.slot(), prefix, points,
+          [&](std::size_t index) {
             const auto started = std::chrono::steady_clock::now();
-            try {
-              *checkpoint = capture();
-            } catch (...) {
-              // Optional retention may refuse; the complete live prefill is
-              // valid.
-              checkpoint->reset();
-            }
+            consume(index, nullptr);
             capture_ms += std::chrono::duration<double, std::milli>(
                               std::chrono::steady_clock::now() - started)
                               .count();
-          });
+          },
+          next);
     } catch (...) {
       qfn.set_position(0);
       throw;
@@ -738,6 +745,22 @@ public:
   }
 
 private:
+  /// Tokens one prefill step takes from `offset`. A step the pass capacity
+  /// ends before the prompt stops on a selection block (prefill_alignment),
+  /// as the serving runner ends budget-limited ones, so the next step
+  /// continues the prompt exactly from an unaligned reused frontier too.
+  [[nodiscard]] std::size_t StepTokens(std::size_t offset, std::size_t budget,
+                                       std::size_t remaining,
+                                       std::size_t capacity) const noexcept {
+    auto count = std::min({budget, remaining, capacity});
+    const std::size_t ratio =
+        std::max<std::uint32_t>(1, model_->config().compress_ratio);
+    if (const auto over = (offset + count) % ratio;
+        count < remaining && count > over)
+      count -= over;
+    return count;
+  }
+
   mutable models::qwen::vision::ImageCache image_cache_;
   std::shared_ptr<QwenFlashNextModel> model_;
   std::uint32_t max_context_;
