@@ -23,6 +23,10 @@
 #include "src/models/qwen36_35b_a3b/kernels/rocm/kernels.hpp"
 #include "src/models/qwen36_35b_a3b/mtp_sampling.hpp"
 
+namespace gufo::models::qwen36_35b_a3b {
+class ContinuationAdapter;
+}  // namespace gufo::models::qwen36_35b_a3b
+
 namespace gufo::models::qwen36_35b_a3b::rocm {
 
 class Executor;
@@ -63,6 +67,7 @@ public:
 
 private:
   friend class Executor;
+  friend class qwen36_35b_a3b::ContinuationAdapter;
   Session() = default;
 
   struct LinearState {

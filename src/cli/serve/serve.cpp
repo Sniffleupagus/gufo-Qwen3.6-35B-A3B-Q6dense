@@ -26,6 +26,7 @@
 
 #include "gufo/ext/registry.hpp"
 #include "src/cli/arg_parser.hpp"
+#include "src/cli/provider_options.hpp"
 #include "src/cli/sampling_options.hpp"
 #include "src/cli/serve/asr_service.hpp"
 #include "src/cli/serve/decision_service.hpp"
@@ -35,6 +36,7 @@
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/sampling_request.hpp"
+#include "src/cli/speculative_settings.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 #include "src/core/platform/shutdown_signal.hpp"
 
@@ -583,12 +585,20 @@ void PrintServeHelp(std::string_view program_name,
     std::filesystem::path model;
     std::vector<std::string> names;
     ArgParser parser(std::string(program_name) + " serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve image generation and editing (Qwen-Image-2.1 or "
+                     "an image extension provider).");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Image model directory (Diffusers layout)", "Model",
+                     &model);
     AddServedModelNamesOption(parser, &names);
+    ext::Registry registry;
+    ext::RegisterBuiltExtensions(registry);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help, false);
+    ProviderOptions provider_options(registry,
+                                     std::string(ext::kImageServeCommand),
+                                     ext::Capability::kImageGeneration);
+    provider_options.Register(parser);
     parser.PrintHelp();
     return;
   }
@@ -765,7 +775,7 @@ void PrintServeHelp(std::string_view program_name,
                      &min_draft_tokens);
     parser.AddOption(
         "", "--prefill-chunk", "N",
-        "Maximum prompt tokens between active decode rounds (default: 512)",
+        "Deprecated and ignored: prompts beside decoders are split by layers",
         "Scheduling", &prefill_chunk_tokens);
     parser.AddOption("", "--max-pending", "N",
                      "Maximum queued generation requests (default: 16)",
@@ -816,6 +826,10 @@ void PrintServeHelp(std::string_view program_name,
     parser.AddOption("", "--trace", "PATH", kTraceHelp, "Logging", &trace_path);
     ServerOptionHelpTargets server_help;
     AddServerOptionsForHelp(parser, &server_help);
+    ext::Registry registry;
+    ext::RegisterBuiltExtensions(registry);
+    ProviderOptions provider(registry, "serve");
+    provider.Register(parser);
     parser.PrintHelp();
     return;
   }
@@ -1121,11 +1135,17 @@ int RunServe(std::span<const char* const> args) {
     std::filesystem::path model;
     std::vector<std::string> names;
     ArgParser parser("gufo serve image",
-                     "Serve Qwen-Image-2.1 generation and editing.");
+                     "Serve image generation and editing (Qwen-Image-2.1 or "
+                     "an image extension provider).");
     parser.AddOption("-m", "--model", "DIR",
-                     "Qwen-Image-2.1 safetensors directory", "Model", &model);
+                     "Image model directory (Diffusers layout)", "Model",
+                     &model);
     AddServedModelNamesOption(parser, &names);
     add_server_options(parser, false);
+    ProviderOptions declared_options(registry,
+                                     std::string(ext::kImageServeCommand),
+                                     ext::Capability::kImageGeneration);
+    declared_options.Register(parser);
     if (!parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << '\n';
       return 2;
@@ -1134,23 +1154,51 @@ int RunServe(std::span<const char* const> args) {
       PrintServeHelp("gufo", "image");
       return 0;
     }
+    ext::ParsedOptions provider_options;
+    try {
+      provider_options = declared_options.Parse();
+    } catch (const std::invalid_argument& error) {
+      std::cerr << "Error: " << error.what() << '\n';
+      return 2;
+    }
     if (!prepare_server_options())
       return 2;
     if (model.empty()) {
       std::cerr << "Error: --model <DIR> is required for image server\n";
       return 2;
     }
-    ModelLoadLog load_log("qwen_image_21", model);
+    // Selection reads only the probe's metadata, so option errors (another
+    // provider's option, a missing sidecar path) stop before any weights load.
+    const ext::ImageProvider* provider = nullptr;
     try {
-      images = std::make_shared<server::ImageService>(
-          model, names.empty() ? "Qwen-Image-2.1" : names.front(),
-          server::ImageService::Runner{}, ModelAliases(names));
+      provider =
+          &server::SelectImageProvider(registry, model, provider_options);
+    } catch (const std::invalid_argument& error) {
+      std::cerr << "Error: " << error.what() << '\n';
+      return 2;
     } catch (const std::exception& error) {
-      std::cerr << "Error loading Qwen-Image-2.1: " << error.what() << '\n';
+      std::cerr << "Error loading image model: " << error.what() << '\n';
       return 1;
     }
-    load_log.Complete("model=" + images->model_id() +
-                      " weights=mapped upload=on_demand");
+    std::string kind = provider->id;
+    std::ranges::replace(kind, '-', '_');
+    ModelLoadLog load_log(kind, model);
+    try {
+      images = std::make_shared<server::ImageService>(
+          server::CreateImageRunner(*provider, model, provider_options),
+          names.empty() ? (provider->id == "qwen-image-21" ||
+                                   provider->id == "qwen-image-2.1"
+                               ? "Qwen-Image-2.1"
+                               : provider->id)
+                        : names.front(),
+          ModelAliases(names));
+    } catch (const std::exception& error) {
+      std::cerr << "Error loading image model " << provider->id << ": "
+                << error.what() << '\n';
+      return 1;
+    }
+    load_log.Complete("model=" + images->model_id() + " provider=" +
+                      provider->id + " weights=mapped upload=on_demand");
   } else if (subcommand == "video") {
     std::filesystem::path video_model;
     std::filesystem::path video_root = "video-jobs";
@@ -1434,7 +1482,7 @@ int RunServe(std::span<const char* const> args) {
                          &min_draft_tokens);
     llm_parser.AddOption(
         "", "--prefill-chunk", "N",
-        "Maximum prompt tokens between active decode rounds (default: 512)",
+        "Deprecated and ignored: prompts beside decoders are split by layers",
         "Scheduling", &prefill_chunk_tokens);
     llm_parser.AddOption("", "--max-pending", "N",
                          "Maximum queued generation requests (default: 16)",
@@ -1488,6 +1536,8 @@ int RunServe(std::span<const char* const> args) {
                          &trace_path);
 
     add_server_options(llm_parser);
+    ProviderOptions provider_options(registry, "serve");
+    provider_options.Register(llm_parser);
     if (!llm_parser.Parse(sub_args, &parse_err)) {
       std::cerr << "Error: " << parse_err << "\n";
       PrintServeHelp("gufo", "llm");
@@ -1502,6 +1552,15 @@ int RunServe(std::span<const char* const> args) {
     }
     if (!prepare_server_options()) {
       return 2;
+    }
+    // Every in-tree text runner splits prompt passes by layers beside
+    // decoders; runners without a scheduling profile keep the fixed legacy
+    // budget. Removed with the legacy path (#1028 phase 4).
+    if (llm_parser.WasSupplied("--prefill-chunk")) {
+      server::Logger::Warn(
+          "scheduling",
+          "event=deprecated_option option=--prefill-chunk action=ignored "
+          "reason=layered_prefill");
     }
     // Progress lines are INFO-tier. Under a quieter threshold `--log-progress`
     // would be accepted and then silently discarded, so reject the combination
@@ -1528,8 +1587,7 @@ int RunServe(std::span<const char* const> args) {
         json::Value::object(), sampling_config, &validated_sampling);
     if (max_tokens < -1 || max_tokens == 0 ||
         max_tokens > std::numeric_limits<std::uint32_t>::max() ||
-        prefill_chunk_tokens == 0 || max_pending_requests == 0 ||
-        max_pending_requests_per_client == 0 ||
+        max_pending_requests == 0 || max_pending_requests_per_client == 0 ||
         max_pending_requests_per_client > max_pending_requests ||
         max_output_bytes == 0 || max_buffered_output_bytes == 0 ||
         max_buffered_output_bytes_total == 0 ||
@@ -1544,8 +1602,8 @@ int RunServe(std::span<const char* const> args) {
       return 2;
     }
     if (draft_tokens == 0 || min_draft_tokens == 0 ||
-        min_draft_tokens > draft_tokens ||
-        draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
+        draft_tokens > std::numeric_limits<std::uint32_t>::max() ||
+        min_draft_tokens > std::numeric_limits<std::uint32_t>::max()) {
       std::cerr << "Error: speculative draft limits are invalid\n";
       return 2;
     }
@@ -1580,12 +1638,13 @@ int RunServe(std::span<const char* const> args) {
                 << "' is not supported by the HTTP server\n";
       return 2;
     }
+    // Unset draft settings take the selected provider's defaults during load.
+    const auto speculative_flags = SpeculativeFlags::Given(
+        llm_parser, static_cast<std::uint32_t>(draft_tokens),
+        static_cast<std::uint32_t>(min_draft_tokens), draft_policy);
     try {
-      if (!draft_policy.empty() &&
-          speculative_config.backend != server::TextSpeculativeBackend::kDFlash)
-        throw std::invalid_argument("--draft-policy requires DFlash2");
-      speculative_config.dflash_policy =
-          server::speculative::ParseDFlashDraftPolicy(draft_policy);
+      provider_options.Parse();
+      CheckSpeculativeFlags(registry, speculative_backend, speculative_flags);
     } catch (const std::invalid_argument& exception) {
       std::cerr << "Error: " << exception.what() << '\n';
       return 2;
@@ -1602,26 +1661,20 @@ int RunServe(std::span<const char* const> args) {
         : speculative_config.backend == server::TextSpeculativeBackend::kMtp
             ? mtp_model_path
             : dflash_model_path;
-    speculative_config.max_draft_tokens =
-        static_cast<std::uint32_t>(draft_tokens);
-    speculative_config.min_draft_tokens =
-        static_cast<std::uint32_t>(min_draft_tokens);
     if (model.empty()) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
     std::string err;
     ModelLoadLog load_log("text", model);
+    server::TextSpeculativeConfig loaded_speculative = speculative_config;
     backend = std::make_shared<server::InferenceBackend>();
     // The disk snapshot tier is walked during load, which can take minutes.
     // Answer 503 `Loading model` on the port meanwhile, as llama-server does,
     // so supervisors see a loading server rather than a refused connection.
     server::LoadingResponder loading(host, port);
     const bool load_ok = backend->load(
-        model, &err, max_context, session_count,
-        server::TextPrefillPolicy{
-            .decode_active_tokens = prefill_chunk_tokens,
-        },
+        model, &err, max_context, session_count, server::TextPrefillPolicy{},
         server::TextSchedulerPolicy{
             .max_pending_requests = max_pending_requests,
             .max_pending_requests_per_client = max_pending_requests_per_client,
@@ -1645,7 +1698,22 @@ int RunServe(std::span<const char* const> args) {
             .staging_capacity_bytes = cache_disk_staging_bytes,
             .model_artifact_fingerprint = {},
         },
-        vision_model_path, cache_ram, enable_yarn);
+        vision_model_path, cache_ram, enable_yarn,
+        [&](const ext::TextProvider& provider, const core::GgufReader&,
+            ext::TextRunnerOptions* options, std::string* error) {
+          try {
+            options->provider_options = provider_options.Select(provider.id);
+            ApplySpeculativeSettings(
+                ResolveSpeculativeSettings(provider, speculative_backend,
+                                           speculative_flags),
+                &options->speculative);
+            loaded_speculative = options->speculative;
+            return true;
+          } catch (const std::invalid_argument& exception) {
+            *error = exception.what();
+            return false;
+          }
+        });
     loading.stop();
     if (!load_ok) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
@@ -1703,7 +1771,10 @@ int RunServe(std::span<const char* const> args) {
         "model=" + backend->model_id() +
         " sessions=" + std::to_string(session_count) + " context_tokens=" +
         std::to_string(backend->max_context()) + " speculative=" + speculation +
-        " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
+        " draft_limit=" + std::to_string(loaded_speculative.max_draft_tokens) +
+        (loaded_speculative.draft_policy.empty()
+             ? std::string()
+             : " draft_policy=" + loaded_speculative.draft_policy) +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled") +
         served_names);
   }

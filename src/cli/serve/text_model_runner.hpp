@@ -31,6 +31,8 @@ using ext::InitialOutputState;
 using ext::kHostSnapshotHeadroomBytes;
 using ext::MeminfoAvailableBytes;
 using ext::ParseRamCacheOption;
+using ext::PrefillYield;
+using ext::ReasoningMarkup;
 using ext::TextDecodeSelection;
 using ext::TextDecodeStep;
 using ext::TextExecutionPlan;
@@ -47,10 +49,8 @@ using ext::TextRunnerDescriptor;
 using ext::TextRunnerDiskCacheOptions;
 using ext::TextRunnerMeasuredResources;
 using ext::TextRunnerNgramRows;
-using ext::TextRunnerPersistenceDescriptor;
 using ext::TextRunnerRamCacheOptions;
 using ext::TextRunnerResourceClaim;
-using ext::TextRunnerSnapshot;
 using ext::TextRunnerState;
 using ext::TextRunnerToken;
 
@@ -115,7 +115,11 @@ public:
     static constexpr std::size_t kSharedPrefixMinTokens = 512;
 
     void PrepareBatchExecution();
-    [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens);
+    /// With `yield`, a runner with a scheduling profile splits the pass into
+    /// at most `layer_groups` layer groups and runs it between them.
+    [[nodiscard]] TextPrefillStep Prefill(std::size_t max_input_tokens,
+                                          std::size_t layer_groups = 1,
+                                          const PrefillYield& yield = {});
     [[nodiscard]] TextDecodeSelection SelectNext();
     void Advance();
     [[nodiscard]] TextDecodeStep DecodeStep(std::size_t max_tokens);
@@ -191,10 +195,16 @@ private:
 
 /// Build output constraints and attach server-authored instructions as framing,
 /// preserving client message content and the model's native prompt layout.
+/// `tool_format` receives the built-in format the request was constrained
+/// with (none for a provider syntax) and `tool_dialect` the runner's dialect
+/// identity, which the response parsers select by. Throws
+/// std::invalid_argument for an identity that is neither built in nor
+/// registered.
 [[nodiscard]] std::optional<ChatRequest> ConstrainChatRequest(
     const ChatRequest& request, const TextModelRunner& runner,
     sampling::SamplingConfig* sampling,
-    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr);
+    std::optional<sampling::JsonConstraint::ToolFormat>* tool_format = nullptr,
+    std::string* tool_dialect = nullptr);
 
 }  // namespace gufo::server
 

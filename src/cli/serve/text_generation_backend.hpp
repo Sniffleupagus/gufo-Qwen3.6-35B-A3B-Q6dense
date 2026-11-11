@@ -141,17 +141,20 @@ public:
   };
 
   using InitialOutputState = gufo::ext::InitialOutputState;
+  using ReasoningMarkup = gufo::ext::ReasoningMarkup;
 
   struct SamplingDefaults {
     /// Zero means generate until EOS or the remaining context is exhausted.
     std::size_t max_tokens{0};
     sampling::SamplingConfig sampling;
-    sampling::TextModelPreset model{sampling::TextModelPreset::kUnspecified};
+    /// Provider defaults; unset leaves unsupplied controls at `sampling`.
+    std::optional<sampling::TextSamplingDefaults> provider;
     sampling::SamplingOverrides supplied{sampling::SamplingOverrides::All()};
 
     [[nodiscard]] sampling::SamplingConfig Resolve(
         std::optional<bool> thinking) const {
-      return sampling::ResolveTextSampling(model, thinking, sampling, supplied);
+      return sampling::ResolveTextSampling(provider, thinking, sampling,
+                                           supplied);
     }
   };
 
@@ -188,6 +191,11 @@ public:
     std::size_t active_decode_prefill_chunks{0};
     std::size_t max_prefill_chunk_tokens{0};
     std::size_t max_consecutive_active_prefill_chunks{0};
+    /// Most layer groups the host asked one of this request's passes to be
+    /// split into; a runner may add a boundary where a pass would stall.
+    std::size_t max_prefill_layer_groups{1};
+    /// Decode rounds other sessions ran between those groups.
+    std::size_t prefill_yield_rounds{0};
     std::size_t configured_active_prefill_tokens{0};
     std::size_t queue_depth_at_submit{0};
     std::size_t client_queue_depth_at_submit{0};
@@ -245,6 +253,22 @@ public:
     [[nodiscard]] virtual std::optional<sampling::JsonConstraint::ToolFormat>
     ToolFormat() const {
       return std::nullopt;
+    }
+    /// Tool dialect identity the response parsers select markers, closers
+    /// and the call parser by; stable for this admitted request. The default
+    /// is the built-in identity of ToolFormat(), and none keeps the legacy
+    /// detection. An identity that is neither built in nor registered
+    /// recognizes no calls.
+    [[nodiscard]] virtual std::optional<std::string> ToolDialectId() const {
+      const auto format = ToolFormat();
+      if (!format)
+        return std::nullopt;
+      return std::string(ext::BuiltinToolDialectId(*format));
+    }
+    /// Reasoning delimiters the response parsers use for this admitted
+    /// request. Backends without this metadata retain `<think>`/`</think>`.
+    [[nodiscard]] virtual ReasoningMarkup ReasoningDelimiters() const {
+      return {"<think>", "</think>"};
     }
   };
 
@@ -369,6 +393,14 @@ public:
   /// template, before tokenization. Empty when the backend cannot tell.
   [[nodiscard]] virtual std::optional<std::string> render_chat_prompt(
       const ChatRequest&) const {
+    return std::nullopt;
+  }
+
+  /// Token ids of raw text as a raw prompt tokenizes: control-token spellings
+  /// become their special tokens and nothing is prepended. Empty when the
+  /// backend cannot tell.
+  [[nodiscard]] virtual std::optional<std::vector<std::uint32_t>> tokenize(
+      std::string_view) const {
     return std::nullopt;
   }
 };

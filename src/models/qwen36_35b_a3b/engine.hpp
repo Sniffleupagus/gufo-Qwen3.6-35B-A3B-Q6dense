@@ -48,6 +48,7 @@ struct ModelOptions {
 
 class Session;
 class SessionSnapshot;
+class ContinuationAdapter;
 
 /// Gufo-owned API over the ROCm runtime: one resident model, any number of
 /// sessions with shared projection batches and independent context state.
@@ -108,6 +109,7 @@ private:
   MtpBatchController batch_policy_;
 
   friend class Session;
+  friend class ContinuationAdapter;
 };
 
 /// One conversation's context. Sync feeds a prompt (reusing whatever prefix
@@ -214,6 +216,7 @@ public:
 
 private:
   friend class Model;
+  friend class ContinuationAdapter;
   Session(std::shared_ptr<Model> model, std::unique_ptr<rocm::Session> session);
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,

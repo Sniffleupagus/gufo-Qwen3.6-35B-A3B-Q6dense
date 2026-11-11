@@ -122,6 +122,24 @@ def run(binary, model, mode, backend, sampling=None):
     return traces
 
 
+def check_default_sampling(binary, model):
+    # Without sampling flags the model defaults sample, so the seed matters;
+    # an explicit temperature of 0 stays greedy for any seed.
+    def trace(seed, *flags):
+        result = subprocess.run(
+            [binary, "prompt", "--model", model, "--verbose", "--think", "off",
+             "--speculative", "off", "--max-tokens", "48", "--seed", str(seed),
+             "--prompt", "Write a short poem about a river.", *flags],
+            text=True, capture_output=True, timeout=180, check=True)
+        return TRACE.findall(result.stderr)
+
+    if trace(1) == trace(2):
+        raise AssertionError("prompt ignored the model sampling defaults")
+    if trace(1, "--temperature", "0") != trace(2, "--temperature", "0"):
+        raise AssertionError("explicit greedy prompt depends on the seed")
+    print("prompt model sampling defaults and explicit greedy checks passed")
+
+
 def sampling_backends(draft, policies, selection):
     if selection in ("ar", "both"):
         yield "AR", []
@@ -295,7 +313,7 @@ def check_http(binary, model, draft, policies, selection="both"):
                             ("xtc_probability", 0.5), ("dry_multiplier", 0.8),
                             ("top_n_sigma", 2), ("logit_bias", {"42": 1})):
                         request(path, {**payload, field: value}, expected=400)
-                # Suffix-conditioned infill is not implemented (docs/SERVER.md).
+                # Suffix-conditioned infill is not implemented (docs/internal/server.md).
                 request("/infill", {"input_prefix": prompt}, expected=501)
                 print(f"{policy}: {len(SAMPLING_CASES)} sampling configurations, "
                       "serve defaults, five HTTP adapters, replay, SSE and C2 exact")
@@ -373,6 +391,7 @@ def main():
         print("Qwen27B CLI test is missing a selected model artifact")
         return 77
     if args.scope in ("all", "sampling"):
+        check_default_sampling(binary, model)
         check_sampling(binary, model, artifacts[1], policies, args.backend)
     if args.scope in ("all", "http"):
         check_http(binary, model, artifacts[1], policies, args.backend)

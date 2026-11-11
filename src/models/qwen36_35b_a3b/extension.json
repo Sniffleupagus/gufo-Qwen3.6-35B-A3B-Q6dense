@@ -2,7 +2,7 @@
   "schema": 1,
   "name": "qwen36_35b_a3b",
   "version": "0.1.0",
-  "api_version": ">= 0.1.0",
+  "api_version": ">= 0.2.0",
   "entry": "qwen36_35b_a3b_register",
   "registration_target": "gufo_qwen36_35b_a3b",
   "depends": [],
@@ -57,7 +57,7 @@
   "docs": {
     "title": "Qwen3.6 35B-A3B",
     "inputs": "Q6dense GGUF with native MTP; text/images",
-    "guide": "docs/models/qwen3.6-35b-a3b/README.md"
+    "guide": "docs/models/qwen3.6-35b-a3b.md"
   },
   "tests": [
     {

@@ -127,14 +127,6 @@ tokenization::ChatTemplateOptions PromptChatOptions(
                                               kTemplateFamily);
 }
 
-// The Qwen3.6 model card's sampling, unless the caller set a control.
-ext::TextPromptOptions WithModelSampling(ext::TextPromptOptions opt) {
-  opt.sampling = sampling::ResolveTextSampling(
-      sampling::TextModelPreset::kQwen36, PromptReasoningOptions(opt).enabled,
-      opt.sampling, opt.sampling_supplied);
-  return opt;
-}
-
 std::shared_ptr<Model> LoadPromptModel(
     const ext::TextPromptOptions& opt, const core::GgufReader& reader,
     std::chrono::steady_clock::time_point load_start) {
@@ -632,13 +624,13 @@ int RunQwen36Benchmark(const ext::TextBenchOptions& opt,
 int RunQwen36Prompt(const ext::TextPromptOptions& opt,
                     const core::GgufReader& reader,
                     std::chrono::steady_clock::time_point model_load_start) {
-  return RunPromptImpl(WithModelSampling(opt), reader, model_load_start);
+  return RunPromptImpl(opt, reader, model_load_start);
 }
 
 int RunQwen36Chat(const ext::TextPromptOptions& opt,
                   const core::GgufReader& reader,
                   std::chrono::steady_clock::time_point model_load_start) {
-  return RunChatImpl(WithModelSampling(opt), reader, model_load_start);
+  return RunChatImpl(opt, reader, model_load_start);
 }
 
 }  // namespace gufo::models::qwen36_35b_a3b

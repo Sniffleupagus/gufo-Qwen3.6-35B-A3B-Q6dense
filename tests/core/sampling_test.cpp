@@ -13,6 +13,7 @@
 #include <string_view>
 #include <vector>
 
+#include "src/core/json.hpp"
 #include "src/core/json_constraint.hpp"
 
 namespace {
@@ -87,6 +88,51 @@ void TestReasoningBudgetForcesTheEnd() {
   Expect(copy.Sample(Logits(6)) == 6, "the answer is sampled normally");
   copy.ResetHistory({});
   Expect(!copy.ForcedToken(), "a restart resets the reasoning budget");
+}
+
+void TestReasoningBudgetWaitsForOpener() {
+  auto budget = std::make_shared<ReasoningBudget>(*Budget(2));
+  budget->opener = 9;
+  budget->blank = std::make_shared<std::vector<bool>>(
+      std::vector<bool>{false, true, false});
+  SamplingConfig config;
+  config.reasoning_budget = budget;
+  SamplerState opened(config);
+  opened.Accept(1);
+  opened.Accept(9);
+  Expect(!opened.ForcedToken(), "the opener itself spends no budget");
+  opened.Accept(2);
+  opened.Accept(2);
+  Expect(opened.ForcedToken() == TokenId{3},
+         "a self-opened block spends the budget");
+
+  SamplerState text(config);
+  text.Accept(2);
+  text.Accept(9);
+  text.Accept(2);
+  text.Accept(2);
+  Expect(!text.ForcedToken(), "an opener after text does not start a budget");
+
+  SamplerState closed(config);
+  closed.Accept(9);
+  closed.Accept(3);
+  closed.Accept(2);
+  closed.Accept(2);
+  Expect(!closed.ForcedToken(), "a closed block ends a self-opened budget");
+
+  auto zero = std::make_shared<ReasoningBudget>(*budget);
+  zero->tokens = 0;
+  config.reasoning_budget = zero;
+  SamplerState immediate(config);
+  Expect(!immediate.ForcedToken(), "no budget is spent before the opener");
+  immediate.Accept(9);
+  Expect(immediate.ForcedToken() == TokenId{3},
+         "a zero budget forces after the opener");
+
+  SamplerState copied(immediate);
+  Expect(copied.ForcedToken() == TokenId{3}, "a copy keeps the opened budget");
+  copied.ResetHistory({});
+  Expect(!copied.ForcedToken(), "a reset waits for the opener again");
 }
 
 void TestEarlyEndAndNoBudget() {
@@ -204,6 +250,77 @@ void TestReasoningBudgetWithGrammar() {
   Expect(!sampler.ForcedToken() &&
              sampler.Sample(std::vector<float>{5, 0, 1, 0, 4, 0}) == 2,
          "after the forced end the answer still follows the grammar");
+}
+
+// The grammar decides when reasoning ends: the close spelled as ordinary
+// text, or a native call header, ends it before the budget runs out, and the
+// budget must not force its close into the answer afterwards.
+void TestReasoningBudgetFollowsGrammarEnd() {
+  const auto generate = [](std::shared_ptr<const JsonConstraint> grammar,
+                           const std::vector<std::string>& pieces,
+                           std::size_t tokens,
+                           const std::vector<TokenId>& reasoning,
+                           const std::vector<TokenId>& preferred) {
+    auto binding = std::make_shared<TokenConstraint>();
+    binding->grammar = std::move(grammar);
+    binding->vocabulary = std::make_shared<ConstraintVocabulary>(
+        pieces.size(), [&](std::uint32_t i) {
+          return ConstraintVocabulary::Piece{pieces[i], pieces[i].empty()};
+        });
+    SamplingConfig config;
+    config.constraint = binding;
+    auto budget = std::make_shared<ReasoningBudget>();
+    budget->tokens = tokens;
+    budget->forced = {1};
+    budget->ends = {1};
+    config.reasoning_budget = budget;
+    SamplerState sampler(config);
+    std::string text;
+    try {
+      sampler.Accept(reasoning);
+      for (const auto token : reasoning)
+        text += pieces[token];
+      for (const auto token : preferred) {
+        std::vector<float> logits(pieces.size(), 0.0F);
+        logits[token] = 5.0F;
+        const auto sampled = sampler.Sample(logits);
+        sampler.Accept(sampled);
+        text += pieces[sampled];
+      }
+    } catch (const std::exception& error) {
+      text += std::string("[") + error.what() + "]";
+    }
+    return text;
+  };
+
+  const auto json = JsonConstraint::WithReasoning(JsonConstraint::Object());
+  const std::vector<std::string> pieces{"thinking", "</think>", "</", "think>",
+                                        "{\"x\":",  "true}",    ""};
+  const auto spelled = generate(json, pieces, 4, {0, 2, 3, 4}, {5, 6});
+  Expect(spelled == "thinking</think>{\"x\":true}",
+         "a close spelled as text ends the budget too, got " + spelled);
+  const auto spent = generate(json, pieces, 4, {0, 0, 0, 2}, {4, 4, 5, 6});
+  Expect(spent == "thinkingthinkingthinking</</think>{\"x\":true}",
+         "a partial close still reasons and the budget forces the end, got " +
+             spent);
+
+  const auto arguments = JsonConstraint::ToolParameters(
+      gufo::json::parse(R"({"type":"object",
+        "properties":{"value":{"type":"string","const":"42"}},
+        "required":["value"],"additionalProperties":false})"),
+      true, JsonConstraint::ToolFormat::kDeepSeek);
+  const auto tools = JsonConstraint::WithReasoning(
+      JsonConstraint::WithTools(nullptr, {{"record", arguments}}, true, false,
+                                JsonConstraint::ToolFormat::kDeepSeek));
+  const std::vector<std::string> native{
+      "thinking", "</think>",
+      "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"record\">\n",
+      "<｜DSML｜parameter name=\"value\" string=\"true\">42"
+      "</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+      ""};
+  const auto called = generate(tools, native, 2, {0, 2}, {3, 4});
+  Expect(called == native[0] + native[2] + native[3],
+         "a native call header ends the budget too, got " + called);
 }
 
 void TestCompactTargetContract() {
@@ -402,10 +519,12 @@ void TestRawLogprobs() {
 int main() {
   TestRawLogprobs();
   TestReasoningBudgetForcesTheEnd();
+  TestReasoningBudgetWaitsForOpener();
   TestEarlyEndAndNoBudget();
   TestReasoningBudgetMatchesLlamaCpp();
   TestReasoningBudgetKeepsLiteralAnswer();
   TestReasoningBudgetWithGrammar();
+  TestReasoningBudgetFollowsGrammarEnd();
   TestCompactTargetContract();
   TestTopPOverLargeVocabularyMatchesDefinition();
   std::cout << "sampling_test passed\n";

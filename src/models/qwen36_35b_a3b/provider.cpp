@@ -35,6 +35,8 @@ void qwen36_35b_a3b_provider_register(gufo::ext::Registry& registry) {
       .bench_driver = &gufo::models::qwen36_35b_a3b::RunQwen36Benchmark,
       .prompt_driver = &gufo::models::qwen36_35b_a3b::RunQwen36Prompt,
       .chat_driver = &gufo::models::qwen36_35b_a3b::RunQwen36Chat,
+      .sampling_defaults =
+          &gufo::models::qwen36_35b_a3b::Qwen36SamplingDefaults,
   });
 #endif
 }

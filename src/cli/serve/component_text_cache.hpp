@@ -17,7 +17,6 @@ namespace gufo::server {
 using ext::TextModelRunner;
 using ext::TextPromptContext;
 using ext::TextRunnerDiskCacheOptions;
-using ext::TextRunnerSnapshot;
 using ext::TextRunnerState;
 
 // The capture/backing contracts are cache-owned (RFC step 6); these aliases
@@ -58,7 +57,7 @@ public:
     void Invalidate() noexcept;
     [[nodiscard]] std::size_t CaptureBytes() const;
     [[nodiscard]] std::size_t CaptureBytes(std::size_t boundary) const;
-    [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Capture();
+    [[nodiscard]] std::unique_ptr<ContinuationSnapshot> Capture();
     void PreparePrefill(std::size_t tokens);
     [[nodiscard]] ComponentCacheMetrics Metrics() const;
     [[nodiscard]] std::vector<std::size_t> PlannedCaptures(
@@ -68,6 +67,11 @@ public:
     friend class ComponentTextCache;
     std::unique_ptr<Impl> impl_;
   };
+  // Ledger room for index and request metadata when the RAM cache is off. It
+  // caps accounting only; the memory is not reserved. A caller sizing the
+  // ledger from host RAM keeps at least this much, so a host short of its
+  // reserve still loads the model with the cache off.
+  static constexpr std::size_t kOffMetadataBytes = std::size_t{64} << 20;
   // Slots allocate under the larger of ram_bytes and ceiling_bytes, so a
   // smaller budget does not refuse what they pin. The RAM limit then becomes
   // the budget plus those pins, within the host ceiling. With `ram_enabled`
@@ -94,6 +98,8 @@ public:
       std::span<const ContinuationToken>, const TextPromptContext*,
       bool common = false) const;
   [[nodiscard]] std::size_t capacity() const noexcept;
+  // RAM the cache may retain after host limits; zero with the RAM cache off.
+  [[nodiscard]] std::size_t ram_budget() const noexcept;
 
 private:
   std::unique_ptr<Impl> impl_;

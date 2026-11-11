@@ -18,6 +18,7 @@
 #include <utility>
 #include <vector>
 
+#include "gufo/ext/component_cache_resources.hpp"
 #include "gufo/ext/gguf_identity.hpp"
 #include "gufo/ext/host_budget.hpp"
 #include "src/families/qwen/text/chat_template.hpp"
@@ -25,7 +26,9 @@
 #include "src/families/qwen/vision/encoder.hpp"
 #include "src/families/qwen/vision/image_cache.hpp"
 #include "src/families/qwen/vision/prompt.hpp"
+#include "src/models/qwen36_35b_a3b/continuation_adapter.hpp"
 #include "src/models/qwen36_35b_a3b/engine.hpp"
+#include "src/models/qwen36_35b_a3b/probe.hpp"
 
 namespace gufo::models::qwen36_35b_a3b {
 namespace {
@@ -82,6 +85,27 @@ std::vector<std::uint8_t> Qwen36CompatibilityIdentity(
   }
   const std::string canonical = identity.str();
   return {canonical.begin(), canonical.end()};
+}
+
+// Without a disk cache, checkpoints live only as long as this loaded model.
+std::vector<std::uint8_t> Qwen36ProcessIdentity(
+    const void* model, std::uint32_t max_context, bool use_mtp,
+    std::uint32_t max_draft_tokens, std::uint32_t decode_concurrency) {
+  std::ostringstream identity;
+  identity << "schema=gufo-process-text-continuation-v1\n"
+           << "model_kind=qwen36-35b-a3b\n"
+           << "model_instance=" << model << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "mtp=" << use_mtp << '\n'
+           << "draft_max_tokens=" << max_draft_tokens << '\n'
+           << "draft_cost_concurrency=" << decode_concurrency << '\n';
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+[[nodiscard]] hip::ComponentCacheHooks HipComponentCacheHooks() {
+  return {[] { return ext::HostSnapshotCeilingBytes(); },
+          [](std::string_view) {}, [](std::string_view) {}};
 }
 
 std::vector<std::int32_t> EngineTokens(
@@ -194,24 +218,19 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   return image->prompt;
 }
 
-// Each request owns its recurrent/KV state and host-memory snapshots;
-// target projections share batches, and sampling and rollback stay
-// request-local.
+// Each cache slot owns one session's recurrent/KV state; target projections
+// share batches, and sampling and rollback stay request-local. The adapter
+// guards checkpoint rows before every write.
 class Qwen36TextRunnerState final : public TextRunnerState {
 public:
-  Qwen36TextRunnerState(const std::shared_ptr<Model>& model,
-                        std::uint32_t max_context, bool use_mtp) {
-    std::string error;
-    session_ = model->CreateSession(use_mtp ? core::SessionMode::kSpeculative
-                                            : core::SessionMode::kAutoregressive,
-                                    max_context, &error);
-    if (session_ == nullptr)
-      Fail("session creation failed: " + error);
+  Qwen36TextRunnerState(ContinuationAdapter& adapter, cache::Slot& slot)
+      : adapter_(&adapter), slot_(&slot) {
+    session_ = &adapter.GetSession(slot);
   }
 
   void Invalidate() noexcept override {
     session_->SetCancellationCheck({});
-    session_->Reset();
+    (void)adapter_->Invalidate(*slot_);
     position_ = 0;
   }
   void SetCancellationCheck(const CancellationCheck& check) override {
@@ -223,36 +242,27 @@ public:
             .temporary_scratch_bytes = 0};
   }
 
-  [[nodiscard]] Session& session() const { return *session_; }
+  /// Read-only access, settling the slot's transfers.
+  [[nodiscard]] Session& session() const {
+    return adapter_->GetSession(*slot_);
+  }
+  /// Access for an operation that writes state from the current frontier.
+  [[nodiscard]] Session& Mutate(bool restart = false) const {
+    adapter_->BeforeMutation(*slot_, restart);
+    return *session_;
+  }
+  void ConfigureVision(
+      std::shared_ptr<const models::qwen::vision::Prompt> prompt) const {
+    adapter_->ConfigureVision(*slot_, std::move(prompt));
+  }
   [[nodiscard]] std::size_t position() const noexcept { return position_; }
   void set_position(std::size_t position) noexcept { position_ = position; }
 
 private:
-  std::unique_ptr<Session> session_;
+  ContinuationAdapter* adapter_;
+  cache::Slot* slot_;
+  Session* session_;
   std::size_t position_{0};
-};
-
-class Qwen36TextRunnerSnapshot final : public TextRunnerSnapshot {
-public:
-  Qwen36TextRunnerSnapshot(std::shared_ptr<Model> model,
-                           std::unique_ptr<SessionSnapshot> snapshot,
-                           std::size_t position)
-      : model(std::move(model)),
-        snapshot(std::move(snapshot)),
-        position(position) {}
-
-  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
-    if (snapshot == nullptr ||
-        snapshot->SizeBytes() > static_cast<std::uint64_t>(
-                                    std::numeric_limits<std::size_t>::max())) {
-      return 0;
-    }
-    return static_cast<std::size_t>(snapshot->SizeBytes());
-  }
-
-  std::shared_ptr<Model> model;
-  std::unique_ptr<SessionSnapshot> snapshot;
-  std::size_t position;
 };
 
 Qwen36TextRunnerState& RequireState(TextRunnerState& state) {
@@ -271,15 +281,47 @@ const Qwen36TextRunnerState& RequireState(const TextRunnerState& state) {
 
 class Qwen36TextRunner final : public HipTextModelRunner {
 public:
-  Qwen36TextRunner(
-      std::shared_ptr<Model> model, std::uint32_t max_context, bool use_mtp,
-      std::uint32_t max_draft_tokens,
-      std::optional<TextRunnerPersistenceDescriptor> persistence = std::nullopt)
+  Qwen36TextRunner(std::shared_ptr<Model> model, std::uint32_t max_context,
+                   bool use_mtp, std::uint32_t max_draft_tokens,
+                   std::string artifact_fingerprint = {})
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens),
-        persistence_(std::move(persistence)) {}
+        max_draft_tokens_(max_draft_tokens) {
+    // Durable caches need the full artifact fingerprint; an in-process
+    // cache is bound to this loaded model.
+    if (!artifact_fingerprint.empty()) {
+      component_identity_ = Qwen36CompatibilityIdentity(
+          artifact_fingerprint, use_mtp_, max_context_, max_draft_tokens_,
+          model_->DecodeConcurrency());
+    } else {
+      component_identity_ =
+          Qwen36ProcessIdentity(model_.get(), max_context_, use_mtp_,
+                                max_draft_tokens_, model_->DecodeConcurrency());
+    }
+  }
+
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override {
+    (void)ram;
+    return hip::CreateHipComponentCacheResources(
+        std::make_unique<ContinuationAdapter>(
+            model_,
+            use_mtp_ ? core::SessionMode::kSpeculative
+                     : core::SessionMode::kAutoregressive,
+            max_context_, component_identity_),
+        ledger, HipComponentCacheHooks());
+  }
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    return std::make_unique<Qwen36TextRunnerState>(
+        dynamic_cast<ContinuationAdapter&>(adapter), slot);
+  }
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireState(state).set_position(position);
+  }
 
   sampling::JsonConstraint::ToolFormat ToolFormat() const override {
     return sampling::JsonConstraint::ToolFormat::kQwen;
@@ -294,8 +336,6 @@ public:
             TextRunnerCapabilities{
                 .supports_vision = model_->VisionEncoder() != nullptr,
                 .incremental_prefill = true,
-                .snapshot = true,
-                .fork = true,
                 .final_token_advance_required = false,
                 .incremental_text_is_exact = true,
                 .multi_token_decode = use_mtp_,
@@ -303,8 +343,7 @@ public:
                 .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
                 .prefix_reuse = true,
             },
-        .persistence = persistence_,
-        .sampling_preset = sampling::TextModelPreset::kQwen36,
+        .sampling_defaults = Qwen36SamplingDefaults(),
     };
   }
 
@@ -396,7 +435,7 @@ public:
   void SetPromptContext(
       TextRunnerState& state,
       std::shared_ptr<const TextPromptContext> context) const override {
-    RequireState(state).session().ConfigureVision(QwenPrompt(context));
+    RequireState(state).ConfigureVision(QwenPrompt(context));
   }
 
   [[nodiscard]] ext::InitialOutputState InitialOutputState(
@@ -409,11 +448,6 @@ public:
   [[nodiscard]] std::string Decode(
       std::span<const TextRunnerToken> tokens) const override {
     return model_->tokenizer().Decode(tokens);
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
-    return std::make_unique<Qwen36TextRunnerState>(model_, max_context_,
-                                                   use_mtp_);
   }
 
   void PreparePrefixReuse(
@@ -443,8 +477,12 @@ public:
         {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
     const std::size_t next_position = offset + consumed;
     const auto prefix = EngineTokens(prompt.first(next_position));
+    const auto held = q36.session().Tokens();
+    const bool restart =
+        !q36.session().IsValid() || held.size() > prefix.size() ||
+        !std::ranges::equal(held, std::span(prefix).first(held.size()));
     std::string error;
-    if (!q36.session().Sync(prefix, &error)) {
+    if (!q36.Mutate(restart).Sync(prefix, &error)) {
       q36.set_position(0);
       Fail("prefill failed: " + error);
     }
@@ -481,7 +519,7 @@ public:
     }
     auto& q36 = RequireState(state);
     std::string error;
-    if (!q36.session().Evaluate(static_cast<std::int32_t>(token), &error))
+    if (!q36.Mutate().Evaluate(static_cast<std::int32_t>(token), &error))
       Fail("decode failed: " + error);
     q36.set_position(q36.position() + 1);
   }
@@ -511,7 +549,7 @@ public:
     std::string error;
     const auto budget =
         std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
-    if (!q36.session().DecodeStep(budget, working_sampler, &decoded, &error,
+    if (!q36.Mutate().DecodeStep(budget, working_sampler, &decoded, &error,
                                   q36.stop_at_eos())) {
       Fail("MTP decode failed: " + error);
     }
@@ -549,7 +587,7 @@ public:
         throw std::invalid_argument(std::string(kShortName) +
                                     " token exceeds engine range");
       }
-      requests.push_back({&RequireState(advance.state.get()).session(),
+      requests.push_back({&RequireState(advance.state.get()).Mutate(),
                           static_cast<std::int32_t>(advance.token),
                           &outcomes[requests.size()]});
     }
@@ -587,7 +625,7 @@ public:
     requests.reserve(count);
     for (std::size_t i = 0; i < count; ++i) {
       auto& q36 = RequireState(decodes[i].state.get());
-      auto& session = q36.session();
+      auto& session = q36.Mutate();
       auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
       before.push_back(session.Statistics());
       requests.push_back(
@@ -636,97 +674,13 @@ public:
     return RequireState(state).position();
   }
 
-  [[nodiscard]] std::size_t SnapshotPayloadBytes(
-      const TextRunnerState& state) const override {
-    const std::uint64_t bytes = RequireState(state).session().SnapshotBytes();
-    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
-                                  std::numeric_limits<std::size_t>::max())) {
-      throw std::overflow_error(std::string(kName) +
-                                " snapshot size is unavailable");
-    }
-    return static_cast<std::size_t>(bytes);
-  }
-
-  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
-      const TextRunnerState& state) const override {
-    const auto& q36 = RequireState(state);
-    std::string error;
-    auto snapshot = q36.session().SaveSnapshot(&error);
-    if (snapshot == nullptr)
-      Fail("snapshot failed: " + error);
-    return std::make_unique<Qwen36TextRunnerSnapshot>(
-        model_, std::move(snapshot), q36.position());
-  }
-
-  void RestoreOrFork(TextRunnerState& state,
-                     const TextRunnerSnapshot& snapshot) const override {
-    const auto& q36_snapshot = OwnSnapshot(snapshot);
-    auto& restored = RequireState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(*q36_snapshot.snapshot, &error)) {
-      restored.Invalidate();
-      Fail("snapshot restore failed: " + error);
-    }
-    restored.set_position(q36_snapshot.position);
-  }
-
-  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
-      const TextRunnerSnapshot& snapshot) const override {
-    return OwnSnapshot(snapshot).PayloadBytes();
-  }
-
-  [[nodiscard]] std::size_t SerializePersistentSnapshot(
-      const TextRunnerSnapshot& snapshot,
-      std::span<std::uint8_t> destination) const override {
-    const auto& q36_snapshot = OwnSnapshot(snapshot);
-    if (destination.size() != q36_snapshot.PayloadBytes() ||
-        !q36_snapshot.snapshot->CopyTo(destination)) {
-      throw std::invalid_argument(std::string(kName) +
-                                  " persistent snapshot serialization failed");
-    }
-    return destination.size();
-  }
-
-  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
-                                const SnapshotSink& sink) const override {
-    sink(OwnSnapshot(snapshot).snapshot->bytes());
-  }
-
-  void RestorePersistentSnapshot(
-      TextRunnerState& state,
-      std::span<const std::uint8_t> payload) const override {
-    auto& restored = RequireState(state);
-    std::string error;
-    if (!restored.session().RestoreSnapshot(payload, &error)) {
-      restored.Invalidate();
-      Fail("persistent snapshot restore failed: " + error);
-    }
-    const std::uint32_t position = restored.session().Position();
-    if (position == 0 || position > max_context_) {
-      restored.Invalidate();
-      Fail("persistent snapshot restored an invalid position");
-    }
-    restored.set_position(position);
-  }
-
 private:
-  const Qwen36TextRunnerSnapshot& OwnSnapshot(
-      const TextRunnerSnapshot& snapshot) const {
-    const auto* q36 = dynamic_cast<const Qwen36TextRunnerSnapshot*>(&snapshot);
-    if (q36 == nullptr || q36->model.get() != model_.get() ||
-        q36->snapshot == nullptr) {
-      throw std::invalid_argument(std::string(kName) +
-                                  " snapshot does not belong to this model");
-    }
-    return *q36;
-  }
-
   std::shared_ptr<Model> model_;
   mutable models::qwen::vision::ImageCache image_cache_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
-  std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 
 void SetError(std::string* error, std::string message) {
@@ -828,20 +782,23 @@ std::shared_ptr<ext::TextModelRunner> CreateQwen36TextRunner(
              "Qwen3.6-35B-A3B MTP requires a model loaded with its MTP block");
     return nullptr;
   }
-  // RAM checkpoints cannot outlive this loaded model. Only the disk tier
-  // needs the full artifact fingerprint, which reads every byte.
-  std::optional<TextRunnerPersistenceDescriptor> persistence;
+  try {
+    qwen::vision::PrepareForServing(model->VisionEncoder());
+  } catch (const std::exception& e) {
+    SetError(error, e.what());
+    return nullptr;
+  }
+  // Only the disk tier needs the full artifact fingerprint, which reads every
+  // byte.
+  std::string fingerprint;
   if (!options.disk_cache.directory.empty()) {
-    std::string fingerprint = options.disk_cache.model_artifact_fingerprint;
+    fingerprint = options.disk_cache.model_artifact_fingerprint;
     try {
       if (fingerprint.empty())
         fingerprint = core::GgufIdentityHex(*reader);
-      persistence = TextRunnerPersistenceDescriptor{
-          .compatibility_identity = Qwen36CompatibilityIdentity(
-              fingerprint, use_mtp, max_context, speculative.max_draft_tokens,
-              model->DecodeConcurrency()),
-          .payload_version = Session::kSnapshotPayloadVersion,
-      };
+      (void)Qwen36CompatibilityIdentity(fingerprint, use_mtp, max_context,
+                                        speculative.max_draft_tokens,
+                                        model->DecodeConcurrency());
     } catch (const std::exception& e) {
       SetError(error,
                std::string("Qwen3.6-35B-A3B disk cache fingerprinting failed: ") +
@@ -852,7 +809,7 @@ std::shared_ptr<ext::TextModelRunner> CreateQwen36TextRunner(
   return std::make_shared<Qwen36TextRunner>(std::move(model), max_context,
                                             use_mtp,
                                             speculative.max_draft_tokens,
-                                            std::move(persistence));
+                                            std::move(fingerprint));
 }
 
 }  // namespace gufo::models::qwen36_35b_a3b
