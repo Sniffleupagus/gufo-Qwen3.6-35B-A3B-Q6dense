@@ -473,8 +473,9 @@ void ContinuationAdapter::BeginRestore(
   state.session->tokens_.reserve(target);
   state.session->logits_.reserve(model_->VocabSize());
   std::vector<Coverage> coverage(descriptors_.size());
+  // Executor::Run settles every operation before returning, so no compute
+  // work of this slot is pending.
   GuardRows(state, 0, 0, false);
-  Check(hipStreamSynchronize(model_->executor_->stream()));
   state.expected = std::move(ordered);
   state.coverage = std::move(coverage);
   state.metadata.fill(std::byte{});
@@ -500,9 +501,10 @@ cache::Completion ContinuationAdapter::Transfer(
   }
   ++state.pending;
   try {
-    // Captures read what the compute stream wrote; restores overwrite what
-    // it might still read.
-    Check(hipStreamSynchronize(model_->executor_->stream()));
+    // No compute-stream sync here: transfers run beside other sessions'
+    // execution, and the shared executor stream may be capturing a decode
+    // graph. Every session operation ends with a host read of its logits or
+    // tokens, so this slot's writes are already complete.
     submit(hip_stream);
     job->completion.emplace(hip_stream.Complete());
   } catch (...) {
@@ -814,9 +816,7 @@ bool ContinuationAdapter::Invalidate(cache::Slot& slot) noexcept {
     resetting = &state;
     GuardRows(state, 0, 0, true);
     state.session->Reset();
-    // Reset clears recurrent state with hipMemset on the null stream.
     Check(hipStreamSynchronize(model_->executor_->stream()));
-    Check(hipStreamSynchronize(nullptr));
     state.failed = false;
     state.restoring = false;
     state.expected.clear();
