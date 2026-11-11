@@ -239,6 +239,7 @@ void Session::Reset() {
 }
 
 Executor::~Executor() {
+  (void)hipFree(hook_park_);
   (void)hipFree(batch_logits_);
   (void)hipFree(verification_penalties_);
   (void)hipHostFree(batch_gdn_host_);
@@ -1634,6 +1635,97 @@ bool Executor::Forward(Session& session, std::span<const std::int32_t> tokens,
   return true;
 }
 
+std::vector<std::uint32_t> Executor::LayerHookBoundaries(
+    std::size_t groups) const {
+  const std::uint32_t layers = config().num_layers;
+  std::vector<std::uint32_t> after;
+  for (std::size_t k = 1; k < groups; ++k) {
+    const auto layer = static_cast<std::uint32_t>(k * layers / groups);
+    if (layer == 0)
+      continue;
+    if (layer < layers && (after.empty() || after.back() != layer - 1))
+      after.push_back(layer - 1);
+  }
+  return after;
+}
+
+bool Executor::RunLayerHook(Session& session, std::uint32_t n,
+                            std::string* error_msg) const {
+  (void)session;
+  if (moe_pending_ || moe_vec_pending_ != 0) {
+    AssignError(error_msg, "layer hook with a pending MoE epilogue");
+    return false;
+  }
+  // The decode round reuses the shared scratch and pinned staging; finish
+  // this pass's queued layers first.
+  if (!Check(hipStreamSynchronize(stream_), "layer hook sync", error_msg))
+    return false;
+  const Config& c = config();
+  const std::size_t rows_bytes =
+      static_cast<std::size_t>(n) * c.hidden_size * sizeof(float);
+  if (hook_park_ == nullptr &&
+      !Check(hipMalloc(&hook_park_, 2 * static_cast<std::size_t>(
+                                            options_.max_batch) *
+                                        c.hidden_size * sizeof(float)),
+             "layer hook park", error_msg)) {
+    hook_park_ = nullptr;
+    return false;
+  }
+  if (n > options_.max_batch) {
+    AssignError(error_msg, "layer hook pass exceeds the batch limit");
+    return false;
+  }
+  auto* park = static_cast<std::uint8_t*>(hook_park_);
+  const Scratch base = s_;
+  if (!Check(hipMemcpyAsync(park, s_.res, rows_bytes, hipMemcpyDeviceToDevice,
+                            stream_),
+             "layer hook park", error_msg) ||
+      !Check(hipMemcpyAsync(park + rows_bytes, s_.xn, rows_bytes,
+                            hipMemcpyDeviceToDevice, stream_),
+             "layer hook park", error_msg))
+    return false;
+  // Per-pass bookkeeping a decode rewrites.
+  const auto selected = selected_logits_;
+  const auto routed_max_rows = routed_max_rows_;
+  const auto routed_n_tiles = routed_n_tiles_;
+  const auto routed_64_tiles = routed_64_tiles_;
+  const auto routed_pair_offset = routed_pair_offset_;
+  const auto routed_pair_tiles = routed_pair_tiles_;
+  const auto routed_pair_rows = routed_pair_rows_;
+  const auto routed_tile_rows = routed_tile_rows_;
+  const auto routed_tile_cols = routed_tile_cols_;
+  const auto q8_slot = q8_slot_;
+  const auto shexp_half = shexp_half_ready_;
+  // Moving the hook out keeps a decode inside it from yielding again.
+  auto hook = std::move(hook_);
+  hook_ = {};
+  {
+    // Decode routes outside any pass; prefill routes would also grow arenas
+    // a graph capture forbids.
+    PrefillPhase decode_phase(false);
+    hook();
+  }
+  hook_ = std::move(hook);
+  UseScratch(base);
+  selected_logits_ = selected;
+  routed_max_rows_ = routed_max_rows;
+  routed_n_tiles_ = routed_n_tiles;
+  routed_64_tiles_ = routed_64_tiles;
+  routed_pair_offset_ = routed_pair_offset;
+  routed_pair_tiles_ = routed_pair_tiles;
+  routed_pair_rows_ = routed_pair_rows;
+  routed_tile_rows_ = routed_tile_rows;
+  routed_tile_cols_ = routed_tile_cols;
+  q8_slot_ = q8_slot;
+  shexp_half_ready_ = shexp_half;
+  return Check(hipMemcpyAsync(s_.res, park, rows_bytes,
+                              hipMemcpyDeviceToDevice, stream_),
+               "layer hook unpark", error_msg) &&
+         Check(hipMemcpyAsync(s_.xn, park + rows_bytes, rows_bytes,
+                              hipMemcpyDeviceToDevice, stream_),
+               "layer hook unpark", error_msg);
+}
+
 bool Executor::ForwardBody(Session& session, std::uint32_t n,
                            std::uint32_t n_logits, bool download_logits,
                            bool speculative, std::uint32_t start_pos,
@@ -1683,6 +1775,13 @@ bool Executor::ForwardBody(Session& session, std::uint32_t n,
             il + 1 < c.num_layers ? layers[il + 1].attn_norm.f32()
                                   : model_->output_norm().f32(),
             n);
+    // The combine consumed the MoE epilogue: only res and xn carry into the
+    // next layer, so other sessions may decode here.
+    if (hook_ && prefill_phase && il + 1 < c.num_layers &&
+        std::ranges::binary_search(hook_layers_, il) &&
+        !RunLayerHook(session, n, error_msg)) {
+      return false;
+    }
   }
   // Prefill catches up immediately from shared scratch. Only the short tail
   // needed across calls belongs to this session.

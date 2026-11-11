@@ -191,6 +191,16 @@ std::uint32_t Model::VocabSize() const noexcept {
   return weights_->config.vocab_size;
 }
 
+void Model::SetPrefillYield(std::size_t groups,
+                            std::function<void()> yield) const {
+  if (groups < 2 || !yield) {
+    executor_->SetLayerHook({}, {});
+    return;
+  }
+  executor_->SetLayerHook(executor_->LayerHookBoundaries(groups),
+                          std::move(yield));
+}
+
 std::uint32_t Model::PrefillCapacity() const noexcept {
   return std::min(kPrefillChunkTokens, options_.max_context);
 }

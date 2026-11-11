@@ -290,6 +290,20 @@ public:
                                      SnapshotInfo* info, std::string* error_msg,
                                      std::uint32_t next_drafts = 0) const;
 
+  /// Layer boundaries splitting a prefill pass into at most `groups` groups
+  /// of about equal depth.
+  [[nodiscard]] std::vector<std::uint32_t> LayerHookBoundaries(
+      std::size_t groups) const;
+  /// During kPrefill passes, after each layer in `after_layers` (ascending,
+  /// from LayerHookBoundaries), call `between` with the pass's cross-layer
+  /// rows parked. `between` may decode other sessions; every layer of the
+  /// pass keeps its unsplit arithmetic. An empty hook disables the split.
+  void SetLayerHook(std::vector<std::uint32_t> after_layers,
+                    std::function<void()> between) const {
+    hook_layers_ = std::move(after_layers);
+    hook_ = std::move(between);
+  }
+
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {
     if (session.mtp_.position != position)
@@ -545,6 +559,11 @@ private:
   mutable std::size_t half_cols_{0};
   mutable bool half_bf16_{false};
   mutable unsigned q8_slot_{0};
+  mutable std::vector<std::uint32_t> hook_layers_;
+  mutable std::function<void()> hook_;
+  mutable void* hook_park_{nullptr};  ///< parked pass rows; first use
+  bool RunLayerHook(Session& session, std::uint32_t n,
+                    std::string* error_msg) const;
 };
 
 }  // namespace gufo::models::qwen36_35b_a3b::rocm

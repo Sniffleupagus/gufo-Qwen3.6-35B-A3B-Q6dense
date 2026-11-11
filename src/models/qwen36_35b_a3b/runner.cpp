@@ -279,6 +279,28 @@ const Qwen36TextRunnerState& RequireState(const TextRunnerState& state) {
   return *q36;
 }
 
+// Arms the model's layer hook from the host's yield for one prefill step.
+class PrefillYieldScope {
+public:
+  PrefillYieldScope(const Model& model, const TextRunnerState& state)
+      : model_(model) {
+    if (state.prefill_yield_groups() > 1)
+      model_.SetPrefillYield(state.prefill_yield_groups(),
+                             [&state] { state.YieldPrefill(); });
+  }
+  ~PrefillYieldScope() { model_.SetPrefillYield(1, {}); }
+  PrefillYieldScope(const PrefillYieldScope&) = delete;
+  PrefillYieldScope& operator=(const PrefillYieldScope&) = delete;
+
+private:
+  const Model& model_;
+};
+
+// Beside decoders, prompts keep the 2,048-row pass (about 0.85 s) and split it
+// into layer groups; a decode step takes about 16 ms.
+constexpr std::size_t kMaxPrefillLayerGroups = 8;
+constexpr std::size_t kMaxBatchWidth = 8;
+
 class Qwen36TextRunner final : public HipTextModelRunner {
 public:
   Qwen36TextRunner(std::shared_ptr<Model> model, std::uint32_t max_context,
@@ -344,6 +366,12 @@ public:
                 .prefix_reuse = true,
             },
         .sampling_defaults = Qwen36SamplingDefaults(),
+        .scheduling =
+            TextSchedulingProfile{
+                .pass_tokens = model_->PrefillCapacity(),
+                .max_layer_groups = kMaxPrefillLayerGroups,
+                .max_yield_decode_width = kMaxBatchWidth,
+            },
     };
   }
 
@@ -482,7 +510,9 @@ public:
         !q36.session().IsValid() || held.size() > prefix.size() ||
         !std::ranges::equal(held, std::span(prefix).first(held.size()));
     std::string error;
-    if (!q36.Mutate(restart).Sync(prefix, &error)) {
+    auto& session = q36.Mutate(restart);
+    const PrefillYieldScope yield(*model_, state);
+    if (!session.Sync(prefix, &error)) {
       q36.set_position(0);
       Fail("prefill failed: " + error);
     }
