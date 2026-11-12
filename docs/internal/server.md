@@ -19,7 +19,14 @@ Reference protocols:
 
 The C++20 runtime serves bounded HTTP/1.1 requests with one connection worker
 per request and a separate inference scheduler. Connections close after each
-response. Chat Completions, Responses and Messages stream with Server-Sent
+response. Request heads are parsed in Rust by httparse as RFC 9112 defines
+them: a token method, single spaces in the request line, an origin-form target
+without control bytes in UTF-8, HTTP/1.0 or HTTP/1.1, and header fields without
+control bytes. A bare LF ends a line, and one empty line before the request line
+is ignored. Other heads, `Transfer-Encoding` (chunked bodies are not
+implemented), and `Content-Length` values that are not decimal digits or
+disagree get 400; more than 100 header fields, llama-server's limit too, get
+431. Chat Completions, Responses and Messages stream with Server-Sent
 Events; closing the socket cancels the request in the scheduler. JSON parsing
 rejects duplicate keys, invalid numbers and nesting beyond 128 containers.
 Python may serve development tools and conformance tests, never requests.
@@ -486,6 +493,7 @@ cache snapshots. HTTP handlers do not implement model kernels.
 | `POST` | `/v1/systemone` | A decision model is configured with `gufo serve decision` |
 | `POST` | `/v1/images/generations` | Qwen-Image-2.1 image serving is configured |
 | `POST` | `/v1/images/edits` | Qwen-Image-2.1 image serving is configured |
+| `GET` | `/sdapi/v1/loras` | Qwen-Image-2.1 image serving is configured; lists `--lora` adapters. A text server answers 501 |
 | `POST` | `/v1/videos` | A validated operator-supplied MiniMax H3 checkpoint is configured |
 | `GET` | `/v1/videos/{id}` | MiniMax H3 video serving is configured |
 | `GET` | `/v1/videos/{id}/content` | The requested MiniMax H3 job completed |
@@ -493,13 +501,15 @@ cache snapshots. HTTP handlers do not implement model kernels.
 
 As in llama.cpp, vLLM, TEI and Ollama, these routes ignore request fields they
 do not know, so a client that adds one still works. Known fields whose behavior
-a route cannot provide, such as transcription timestamps or video image
-conditioning, are refused with 400 rather than dropped.
+a route cannot provide, such as transcription timestamps or video
+reference-image conditioning, are refused with 400 rather than dropped.
 
 Use `gufo serve image --model SNAPSHOT_DIR` for
 [Qwen-Image-2.1](../models/qwen-image-2.1.md). Generation accepts JSON;
 editing accepts multipart PNG/JPEG references. Both return base64 PNG data
-and work through llama-swap's image routes.
+and work through llama-swap's image routes. LoRA adapters registered with
+`--lora NAME=PATH` are selected per request with the `loras` field; see
+[LoRA adapters](../models/qwen-image-2.1.md#lora-adapters).
 
 Qwen3-TTS serving is enabled with a dedicated model process. All three 12Hz
 1.7B variants are supported; the variant is detected from the checkpoint's
@@ -637,12 +647,23 @@ Malformed JSON and requests the model rejects return 400, and requests are
 serialized over the one loaded model.
 
 The MiniMax H3 subset follows the asynchronous OpenAI-style video resource
-shape and is versioned independently as `gufo.video-api.v1`. Its supported
-fields, frozen presets, queue behavior, and deliberate conditioning
-omissions are documented in the [H3 upstream contract](models/minimax-h3/QUALITY.md).
+shape and is versioned independently as `gufo.video-api.v1`. Its frozen
+presets and numerical qualification are documented in the
+[H3 upstream contract](models/minimax-h3/QUALITY.md).
 Create requests accept both `application/json` and OpenAI-client-compatible
 `multipart/form-data`; duplicate form fields, malformed boundaries, unsupported
 media types, and reference-image parts fail explicitly.
+Optional `first_frame` and `last_frame` anchors condition generation on a
+keyframe, alone or together: a base64 PNG, JPEG or WebP data URL in JSON, or a
+file part in multipart. Remote URLs are not fetched. With an anchor, `size`
+sets the pixel budget and the first keyframe (or a lone last one) sets the
+aspect ratio, so the video follows the keyframe's shape instead of being
+squeezed into `size`; the job telemetry reports the generated canvas. A
+keyframe outside 1:4 to 4:1 fails the job. An anchor that is not a
+data URL or upload, is empty, exceeds 20 MiB, or does not decode returns 400
+`invalid_frame_image`. `input_reference` and `references` remain unsupported
+and return 400 `unsupported_input_reference`. See
+[keyframe conditioning](models/minimax-h3/README.md#cli-and-server).
 H3 accepts `seconds` as a JSON number or string (including multipart), at
 `512x512` or `1344x768`. Durations from 5 seconds are converted to 24-fps frames
 and rounded up to the official VAE grid (`17n + 5`), within upstream's
@@ -1232,7 +1253,10 @@ Use appropriate HTTP status codes:
 - `429` admission queue full or rate limit exceeded
 - `499` internally recorded client cancellation
 - `500` internal failure
-- `503` model or backend unavailable, or GPU context lost (`device_lost`)
+- `503` model or backend unavailable, GPU context lost (`device_lost`), or a
+  prompt whose host prompt-state bytes do not fit the admission budget
+  (`insufficient_memory`, with `error.required_bytes` and
+  `error.remaining_bytes` and the same values under `usage.gufo`)
 
 Generation stops at the request budget or context capacity and reports a
 length finish reason when either limit is reached.
@@ -1458,6 +1482,18 @@ even if the client disconnects before reading it; requests that fail in the
 scheduler, such as on a deadline or a runner error, add none of these.
 `llamacpp:kv_cache_usage_ratio` is the in-flight prompt and generated tokens
 over sessions times context; retained cache entries are not counted.
+`gufo_prompt_state_budget_bytes` is the host RAM prompt state may claim before
+admission refuses, `gufo_prompt_state_reserved_bytes` the bytes charged to
+in-flight requests, and `gufo_prompt_state_available_bytes` the remainder.
+These gauges appear only for runners that claim prompt state, whose prompts
+allocate host KV rows as they grow. Qwen and Flash-Next allocate full-context
+KV when a session is created and admit it at startup through
+`per_request_state_bytes`, so they claim no prompt state and omit the gauges.
+A claimed charge covers the deterministic KV rows a prompt writes; outstanding
+requests are subtracted conservatively, even if their rows have already
+committed. The check does not reserve output-token growth, evict caches or
+recheck during generation; other allocations can still exhaust memory after
+admission.
 `Server-Timing`, generation `timings`, and Chat Completions `usage.gufo`
 provide request-level measurements.
 

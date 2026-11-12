@@ -293,6 +293,7 @@ add_subdirectory(src/core/platform)
 add_subdirectory(src/core/rust)
 
 add_library(gufo_core STATIC
+  src/core/base64.cpp
   src/core/image.cpp
   src/core/crypto/sha256.cpp
   src/core/gguf_reader.cpp
@@ -300,12 +301,13 @@ add_library(gufo_core STATIC
   src/core/json_constraint.cpp
   src/core/json_schema_lexeme.cpp
   src/core/json_schema_regex.cpp
+  src/core/lora/adapter.cpp
   src/core/sampling.cpp
   src/core/sampling_logit_row.cpp
   src/core/hip/hipblaslt_plan_database.cpp
   src/core/quant/ggml_dequant.cpp
   src/core/quant/ggml_gemm.cpp
-  src/core/wav.cpp
+  src/core/audio.cpp
 )
 target_include_directories(gufo_core PUBLIC ${CMAKE_SOURCE_DIR})
 target_link_libraries(gufo_core PUBLIC gufo_platform ICU::uc ICU::i18n
@@ -496,22 +498,33 @@ if (BUILD_TESTING OR GUFO_BUILD_TOOLS)
 endif()
 
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
-  find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
-  find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
-  add_executable(gufo-kernel-bench
-    src/cli/bench/kernel_bench_main.cpp
-  )
-  target_compile_definitions(gufo-kernel-bench PRIVATE
-    GUFO_REVISION="${GUFO_REVISION}")
-  target_include_directories(gufo-kernel-bench SYSTEM PRIVATE
-    ${ROCTX_INCLUDE_DIR})
-  target_link_libraries(gufo-kernel-bench PRIVATE
-    gufo_kernel_bench_support
-    gufo_diagnostics
-    gufo_core
-    ${GUFO_QWEN_LIBRARIES}
-    gufo_qwen_kernels
-    ${ROCTX_LIBRARY})
+  # TheRock for Windows ships no roctx; skip only gufo-kernel-bench there so
+  # the other tools (e.g. qwen27b_verify_sweep) still build.
+  if (WIN32)
+    find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h)
+    find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx)
+  else()
+    find_path(ROCTX_INCLUDE_DIR rocprofiler-sdk-roctx/roctx.h REQUIRED)
+    find_library(ROCTX_LIBRARY NAMES rocprofiler-sdk-roctx REQUIRED)
+  endif()
+  if (ROCTX_INCLUDE_DIR AND ROCTX_LIBRARY)
+    add_executable(gufo-kernel-bench
+      src/cli/bench/kernel_bench_main.cpp
+    )
+    target_compile_definitions(gufo-kernel-bench PRIVATE
+      GUFO_REVISION="${GUFO_REVISION}")
+    target_include_directories(gufo-kernel-bench SYSTEM PRIVATE
+      ${ROCTX_INCLUDE_DIR})
+    target_link_libraries(gufo-kernel-bench PRIVATE
+      gufo_kernel_bench_support
+      gufo_diagnostics
+      gufo_core
+      ${GUFO_QWEN_LIBRARIES}
+      gufo_qwen_kernels
+      ${ROCTX_LIBRARY})
+  else()
+    message(STATUS "gufo: roctx not found, skipping gufo-kernel-bench")
+  endif()
 
   add_executable(tune_hipblaslt tools/bench/tune_hipblaslt.cpp)
   target_link_libraries(tune_hipblaslt PRIVATE gufo_core gufo_qwen_kernels
@@ -533,8 +546,10 @@ else()
   install(CODE "execute_process(COMMAND \"${CMAKE_COMMAND}\" -E copy \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo.exe\" \"\$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}/bin/gufo-server.exe\")")
 endif()
 if (ENGINE_ENABLE_HIP AND GUFO_BUILD_TOOLS)
-  install(TARGETS gufo-kernel-bench tune_hipblaslt
-    DESTINATION bin)
+  install(TARGETS tune_hipblaslt DESTINATION bin)
+  if (TARGET gufo-kernel-bench)
+    install(TARGETS gufo-kernel-bench DESTINATION bin)
+  endif()
 endif()
 
 # CTest integration
@@ -681,6 +696,11 @@ function(gufo_qwen_image_21_register_tests)
   target_link_libraries(qwen_image_21_test PRIVATE gufo_qwen_image_21 gufo_test_support)
   add_test(NAME qwen_image_21_test COMMAND qwen_image_21_test)
   set_tests_properties(qwen_image_21_test PROPERTIES LABELS "cpu;models;qwen-image")
+  add_executable(qwen_image_21_lora_test
+    ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/lora_test.cpp)
+  target_link_libraries(qwen_image_21_lora_test PRIVATE gufo_qwen_image_21)
+  add_test(NAME qwen_image_21_lora_test COMMAND qwen_image_21_lora_test)
+  set_tests_properties(qwen_image_21_lora_test PROPERTIES LABELS "cpu;models;qwen-image")
   if(ENGINE_ENABLE_HIP AND TARGET gufo_qwen_image_21_hip)
     add_executable(qwen_image_21_weight_upload_test
       ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/weights_test.cpp)
@@ -692,13 +712,18 @@ function(gufo_qwen_image_21_register_tests)
       LABELS "gpu;qwen-image" SKIP_RETURN_CODE 77)
     add_executable(qwen_image_21_kernel_test
       ${PROJECT_SOURCE_DIR}/tests/models/qwen_image_21/kernel_test.hip)
-    target_link_libraries(qwen_image_21_kernel_test PRIVATE gufo_qwen_image_21 gufo_qwen_image_21_hip)
+    target_link_libraries(qwen_image_21_kernel_test PRIVATE gufo_qwen_image_21 gufo_qwen_image_21_hip
+      hip::host roc::hipblas)
     add_test(NAME qwen_image_21_kernel_test COMMAND qwen_image_21_kernel_test)
     set_tests_properties(qwen_image_21_kernel_test PROPERTIES
       LABELS "gpu;qwen-image" SKIP_RETURN_CODE 77)
     add_executable(qwen_image_21_probe
       ${PROJECT_SOURCE_DIR}/tools/models/qwen_image_21/probe.cpp)
     target_link_libraries(qwen_image_21_probe PRIVATE gufo_qwen_image_21 gufo_qwen_image_21_hip)
+    add_executable(qwen_image_21_lora_dump
+      ${PROJECT_SOURCE_DIR}/tools/models/qwen_image_21/lora_dump.cpp)
+    target_link_libraries(qwen_image_21_lora_dump PRIVATE gufo_qwen_image_21 gufo_qwen_image_21_hip
+      hip::host roc::hipblas OpenSSL::Crypto)
   endif()
 endfunction()
 
@@ -792,6 +817,13 @@ endfunction()
   add_test(NAME png_decode_test COMMAND png_decode_test)
   set_tests_properties(png_decode_test PROPERTIES LABELS "cpu;image;correctness")
 
+  add_executable(audio_decode_test tests/core/audio_decode_test.cpp)
+  target_link_libraries(audio_decode_test PRIVATE gufo_core)
+  target_compile_definitions(audio_decode_test PRIVATE
+    GUFO_AUDIO_DECODE_FIXTURES="${PROJECT_SOURCE_DIR}/tests/fixtures/audio")
+  add_test(NAME audio_decode_test COMMAND audio_decode_test)
+  set_tests_properties(audio_decode_test PROPERTIES LABELS "cpu;audio;correctness")
+
   add_executable(wav_decode_test
     tests/core/wav_decode_test.cpp
     tests/core/wav_reference.cpp)
@@ -850,6 +882,29 @@ endfunction()
   add_test(NAME trace_test COMMAND trace_test)
   set_tests_properties(trace_test PROPERTIES LABELS "cpu;server;trace")
   endif()
+
+  add_executable(base64_test
+    tests/core/base64_test.cpp
+    tests/core/base64_reference.cpp)
+  target_link_libraries(base64_test PRIVATE gufo_http)
+  add_test(NAME base64_test COMMAND base64_test)
+  set_tests_properties(base64_test PROPERTIES LABELS "cpu;server;correctness")
+
+  add_executable(websocket_frame_test
+    tests/cli/websocket_frame_test.cpp
+    tests/cli/websocket_frame_reference.cpp)
+  target_link_libraries(websocket_frame_test PRIVATE gufo_core)
+  add_test(NAME websocket_frame_test COMMAND websocket_frame_test)
+  set_tests_properties(websocket_frame_test PROPERTIES
+    LABELS "cpu;server;correctness")
+
+  add_executable(http_request_test
+    tests/cli/http_request_test.cpp
+    tests/cli/http_request_reference.cpp)
+  target_link_libraries(http_request_test PRIVATE gufo_core)
+  add_test(NAME http_request_test COMMAND http_request_test)
+  set_tests_properties(http_request_test PROPERTIES
+    LABELS "cpu;server;http;correctness")
 
   # These HTTP/WebSocket suites drive raw POSIX sockets or fork() directly.
   if (NOT WIN32)
@@ -1067,6 +1122,13 @@ endfunction()
     set_tests_properties(text_cli_dispatch_${command} PROPERTIES LABELS "cpu;cli;extensions")
   endforeach()
 
+  add_executable(extension_diagnostics_test
+    tests/cli/extension_diagnostics_test.cpp
+    src/cli/extension_diagnostics.cpp)
+  target_link_libraries(extension_diagnostics_test PRIVATE gufo_ext_runtime)
+  add_test(NAME extension_diagnostics_test COMMAND extension_diagnostics_test)
+  set_tests_properties(extension_diagnostics_test PROPERTIES LABELS "cpu;cli;extensions")
+
   # H3 host contracts share an object with generation. In HIP builds that
   # object references the backend implementations, so tests need both tiers.
   set(gufo_minimax_h3_test_libraries gufo_minimax_h3)
@@ -1080,6 +1142,7 @@ endfunction()
       src/cli/video/video.cpp
     )
     target_link_libraries(video_cli_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries} gufo_ext_runtime)
+    gufo_target_extensions(video_cli_test EXTENSIONS ${gufo_selected_extensions})
     add_test(NAME video_cli_test COMMAND video_cli_test)
     set_tests_properties(video_cli_test PROPERTIES
       LABELS "cpu;server;cli;minimax-h3;quality")
@@ -1295,6 +1358,14 @@ endfunction()
   add_test(NAME minimax_h3_sampling_test COMMAND minimax_h3_sampling_test)
   set_tests_properties(minimax_h3_sampling_test PROPERTIES
     LABELS "cpu;models;minimax-h3;layout;schedule;rng;quality")
+
+  add_executable(minimax_h3_presentation_test
+    tests/models/minimax_h3_presentation_test.cpp)
+  target_link_libraries(minimax_h3_presentation_test PRIVATE gufo_core ${gufo_minimax_h3_test_libraries})
+  add_test(NAME minimax_h3_presentation_test COMMAND minimax_h3_presentation_test)
+  set_tests_properties(minimax_h3_presentation_test PROPERTIES
+    LABELS "cpu;models;minimax-h3;presentation;tokenizer;external-model"
+    SKIP_RETURN_CODE 77)
 
   add_executable(minimax_h3_generation_test
     tests/models/minimax_h3_generation_test.cpp)
@@ -1551,6 +1622,32 @@ endfunction()
       COMMAND minimax_h3_video_vae_hip_test)
     set_tests_properties(minimax_h3_video_vae_real PROPERTIES
       LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;quality;external-model;very-slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_video_vae_encoder_hip_test
+      tests/models/minimax_h3_video_vae_encoder_hip_test.hip)
+    target_compile_definitions(minimax_h3_video_vae_encoder_hip_test PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+      GUFO_H3_VAE_ENCODER_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/minimax_h3/video-vae-encoder-oracle-v1.json")
+    target_link_libraries(minimax_h3_video_vae_encoder_hip_test PRIVATE
+      gufo_core gufo_minimax_h3 gufo_minimax_h3_hip hip::host)
+    add_test(NAME minimax_h3_video_vae_encoder_real
+      COMMAND minimax_h3_video_vae_encoder_hip_test)
+    set_tests_properties(minimax_h3_video_vae_encoder_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;video;vae;encoder;quality;external-model;slow"
+      SKIP_RETURN_CODE 77)
+
+    add_executable(minimax_h3_vision_tower_hip_test
+      tests/models/minimax_h3_vision_tower_hip_test.hip)
+    target_compile_definitions(minimax_h3_vision_tower_hip_test PRIVATE
+      GUFO_H3_SOURCE_MANIFEST="${CMAKE_CURRENT_SOURCE_DIR}/src/models/minimax_h3/MINIMAX_H3_FL2VA_BF16.source-manifest.json"
+      GUFO_H3_VISION_FIXTURE="${CMAKE_CURRENT_SOURCE_DIR}/tests/fixtures/minimax_h3/vision-tower-oracle-v1.json")
+    target_link_libraries(minimax_h3_vision_tower_hip_test PRIVATE
+      gufo_core gufo_minimax_h3 gufo_minimax_h3_hip hip::host)
+    add_test(NAME minimax_h3_vision_tower_real
+      COMMAND minimax_h3_vision_tower_hip_test)
+    set_tests_properties(minimax_h3_vision_tower_real PROPERTIES
+      LABELS "gpu;hip;gfx1151;minimax-h3;vision;tower;quality;external-model;slow"
       SKIP_RETURN_CODE 77)
 
     add_executable(minimax_h3_audio_vae_hip_test

@@ -215,8 +215,9 @@ public:
       const gufo::sampling::SamplingConfig& sampling,
       const CancellationCheck& is_cancelled, bool stream_output) override {
     if (reject_on_start.has_value()) {
-      throw gufo::server::TextGenerationError(*reject_on_start,
-                                              "injected admission rejection");
+      throw gufo::server::TextGenerationError(
+          *reject_on_start, "injected admission rejection",
+          reject_required_bytes, reject_remaining_bytes);
     }
     return std::make_shared<ProgressRequest>(
         TextGenerationBackend::start_chat(request, max_tokens, sampling,
@@ -265,6 +266,8 @@ public:
   float last_temperature{0.0F};
   gufo::sampling::SamplingConfig last_sampling;
   std::optional<gufo::server::TextGenerationErrorCode> reject_on_start;
+  std::optional<std::size_t> reject_required_bytes;
+  std::optional<std::size_t> reject_remaining_bytes;
 
 private:
   std::mutex mutex;
@@ -608,6 +611,11 @@ void TestCachedPrefillMetrics() {
          "twice");
   Expect(usage && usage->member_size("prompt_tokens") == 7,
          "Token usage includes cached tokens");
+  const auto* compatibility_metrics = usage ? usage->find("gufo") : nullptr;
+  Expect(compatibility_metrics &&
+             compatibility_metrics->find("cache_shared_bytes") &&
+             compatibility_metrics->member_size("cache_shared_bytes") == 0,
+         "Deprecated shared-byte metric remains present and zero");
   Expect(timings && timings->member_size("prompt_n") == 2 &&
              timings->member_double("prompt_per_second") == 800 &&
              timings->member_double("prompt_per_token_ms") == 1.25,
@@ -1208,6 +1216,74 @@ void TestHistoricalTypedArgumentsUseTojson() {
              replayed.tool_calls[0].arguments[0].value == "100000" &&
              replayed.tool_calls[0].arguments[1].value == "[1000000]",
          "Typed historical integers render in decimal");
+  // Numbers replay as the client sent them back: the spelling this server
+  // returned from the model's tokens, not a double's (#1141).
+  const auto spelled = gufo::json::parse(
+      R"({"type":"function_call","call_id":"call_1","name":"read",
+          "arguments":"{\"id\":9007199254740993,\"ratio\":1.0,\"scale\":1e5,\"zero\":-0.0,\"pair\":[1.0,{\"x\":2.50}]}"})");
+  gufo::tokenization::ChatMessage numbers;
+  Expect(
+      gufo::server::ParseOpenAiResponseMessage(spelled, &numbers, budget,
+                                               &error) &&
+          numbers.tool_calls.size() == 1 &&
+          numbers.tool_calls[0].arguments.size() == 5 &&
+          numbers.tool_calls[0].arguments[0].value == "9007199254740993" &&
+          numbers.tool_calls[0].arguments[1].value == "1.0" &&
+          numbers.tool_calls[0].arguments[2].value == "1e5" &&
+          numbers.tool_calls[0].arguments[3].value == "-0.0" &&
+          numbers.tool_calls[0].arguments[4].value == R"([1.0, {"x": 2.50}])",
+      "Typed historical numbers keep their spelling");
+}
+
+// The legacy schema check after an unfinished reasoning quote reads the
+// canonical spelling, which the native number grammar accepts. The client
+// still receives the model's spelling (#1141).
+void TestSchemaCheckedNumbersKeepSpelling() {
+  const std::string call =
+      "<tool_call><function=f><parameter=count>1.0</parameter>"
+      "<parameter=id>9007199254740993</parameter><parameter=ratio>1e5"
+      "</parameter></function></tool_call>";
+  for (const auto* prefix : {"", "Check `foo then\n"})
+    for (const bool stream : {false, true}) {
+      gufo::server::ChatRequest chat;
+      chat.reasoning.enabled = true;
+      Expect(
+          !gufo::server::ParseOpenAiResponseControls(
+              gufo::json::parse(
+                  R"({"tools":[{"type":"function","name":"f","parameters":{"type":"object","properties":{"count":{"type":"integer"},"id":{"type":"integer"},"ratio":{"type":"number"}},"required":["count","id","ratio"],"additionalProperties":false}}]})"),
+              &chat),
+          "schema-checked number fixture has valid controls");
+      chat.constrained_tools = false;
+      FakeBackend backend;
+      backend.tool_format = gufo::sampling::JsonConstraint::ToolFormat::kQwen;
+      backend.pieces = {std::string(prefix) + (*prefix ? "" : "</think>") +
+                        call};
+      const auto response = gufo::server::CreateOpenAiResponse(
+          Request("{}"), backend, chat, 512, {}, stream);
+      gufo::json::Value output;
+      if (!stream)
+        output = gufo::json::parse(response.body);
+      else
+        response.streaming_body([&](std::string_view chunk) {
+          const auto event =
+              gufo::json::parse(chunk.substr(chunk.find("data: ") + 6));
+          if (event.member_str("type") == "response.completed")
+            output = *event.find("response");
+          return true;
+        });
+      std::vector<std::string> arguments;
+      for (const auto& part : output.find("output")->items())
+        if (part.member_str("type") == "function_call")
+          arguments.push_back(part.member_str("arguments"));
+      if (arguments.size() != 1)
+        std::cerr << "Schema-checked numbers: prefix=" << prefix
+                  << " stream=" << stream << " calls=" << arguments.size()
+                  << '\n';
+      Expect(arguments.size() == 1 &&
+                 arguments[0] ==
+                     R"({"count":1.0,"id":9007199254740993,"ratio":1e5})",
+             "schema-checked calls keep the model's number spelling");
+    }
 }
 
 void TestMalformedHistoricalFunctions() {
@@ -1256,7 +1332,8 @@ void TestQwenToolBoundariesAndSchema() {
     "tools":[{"type":"function","function":{"name":"f","parameters":{
       "type":"object","properties":{"text":{"type":"string"},
       "count":{"type":"integer"},"flag":{"type":"boolean"},
-      "limit":{"type":["integer","null"]},"tags":{"type":"array"}}}}}]
+      "limit":{"type":["integer","null"]},"tags":{"type":"array"},
+      "ratio":{"type":"number"}}}}}]
   })");
   const std::string good =
       "<tool_call><function=f><parameter=text>42</parameter>"
@@ -1349,7 +1426,19 @@ void TestQwenToolBoundariesAndSchema() {
              1, R"({"count":100000,"tags":[1000000,-100000]})"},
         Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"count\":"
              "100000}}</tool_call>",
-             1, R"({"count":100000})"}}) {
+             1, R"({"count":100000})"},
+        // Every number keeps the model's spelling, as in llama.cpp: a double
+        // would change 2^53 + 1, 1.0, 1e5 and -0.0 (#1141).
+        Case{"<tool_call><function=f><parameter=count>9007199254740993"
+             "</parameter><parameter=ratio>1.0</parameter><parameter=limit>"
+             "1e5</parameter><parameter=tags>[-0.0, 1E-7, 2.50]</parameter>"
+             "</function></tool_call>",
+             1,
+             R"({"count":9007199254740993,"ratio":1.0,"limit":1e5,)"
+             R"("tags":[-0.0,1E-7,2.50]})"},
+        Case{"<tool_call>{\"name\":\"f\",\"arguments\":{\"count\":"
+             "9007199254740993,\"ratio\":1.0,\"tags\":[1e5]}}</tool_call>",
+             1, R"({"count":9007199254740993,"ratio":1.0,"tags":[1e5]})"}}) {
     for (bool reasoning : {false, true}) {
       for (bool stream : {false, true}) {
         auto body = schema;
@@ -2815,6 +2904,34 @@ void TestStreamingOverloadIsRejectedBeforeHeaders() {
     retry_after = retry_after || (name == "Retry-After" && value == "1");
   }
   Expect(retry_after, "retryable overload advertises Retry-After");
+}
+
+void TestInsufficientMemoryExplainsThePromptBudget() {
+  FakeBackend backend;
+  backend.reject_on_start =
+      gufo::server::TextGenerationErrorCode::kInsufficientMemory;
+  backend.reject_required_bytes = 4096;
+  backend.reject_remaining_bytes = 512;
+  const auto response = gufo::server::HandleOpenAiChat(Request(R"({
+        "model":"test-model",
+        "messages":[{"role":"user","content":"hello"}]
+      })"),
+                                                       backend);
+
+  Expect(response.status == 503, "an unaffordable prompt is refused with 503");
+  const auto body = gufo::json::parse(response.body);
+  const auto* error = body.find("error");
+  Expect(error != nullptr &&
+             error->member_str("code") == "insufficient_memory" &&
+             error->member_size("required_bytes") == 4096 &&
+             error->member_size("remaining_bytes") == 512,
+         "the error body names the budget shortfall");
+  const auto* usage = body.find("usage");
+  const auto* gufo = usage != nullptr ? usage->find("gufo") : nullptr;
+  Expect(gufo != nullptr && gufo->member_str("code") == "insufficient_memory" &&
+             gufo->member_size("required_bytes") == 4096 &&
+             gufo->member_size("remaining_bytes") == 512,
+         "usage.gufo repeats the machine-readable reason");
 }
 
 void TestImagePartsRetainOrderAndIdentity() {
@@ -7727,6 +7844,7 @@ int main() {
   TestStreamingQuotedAndMalformedTools();
   TestIncrementalToolArguments();
   TestHistoricalTypedArgumentsUseTojson();
+  TestSchemaCheckedNumbersKeepSpelling();
   TestStreamingPromptProgress();
   TestResponsesPromptProgress();
   TestToolMarkersInsideConstrainedReasoning();
@@ -7800,6 +7918,7 @@ int main() {
   TestServedModelNamesAreEchoed();
   TestClientIdentityReachesBackend();
   TestStreamingOverloadIsRejectedBeforeHeaders();
+  TestInsufficientMemoryExplainsThePromptBudget();
   TestImagePartsRetainOrderAndIdentity();
   TestTextOnlyBackendRefusesImagesBeforeReading();
   TestImageCountAndByteBudget();

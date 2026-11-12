@@ -17,7 +17,8 @@ set(gufo_pr_targets
   extension_runtime_test extension_role_test
   arg_parser_test transcribe_cli_test json_test json_constraint_test gguf_reader_test qwen_config_test qwen_draft_vocab_test
   gguf_identity_test
-  png_decode_test wav_decode_test
+  png_decode_test wav_decode_test audio_decode_test base64_test websocket_frame_test
+  http_request_test
   heap_placement_test
   admission_memory_test
   platform_publish_test platform_prefault_test platform_mapped_file_test
@@ -29,18 +30,19 @@ set(gufo_pr_targets
   text_generation_scheduler_test layered_prefill_conformance_test
   component_text_cache_test text_model_runner_test
   bench_cli_test prompt_cli_test text_cli_dispatch_test eval_http_client_test
+  extension_diagnostics_test
   # BEGIN GENERATED MODEL PR TARGETS
   deepseek_v4_flash_continuation_identity_test ds4_chat_template_test ds4_cli_test
   ds4_sampling_test embedding_gemma2_batch_scheduler_test embedding_gemma2_config_test
   embedding_gemma2_embeddings_api_test embedding_gemma2_image_processor_test
   embedding_gemma2_video_processor_test minimax_h3_runtime_test minimax_h3_sampling_test
-  qwen27b_continuation_identity_test qwen27b_continuation_layout_test qwen36_35b_a3b_config_test
-  qwen38_flash_next_config_test qwen38_flash_next_continuation_identity_test
-  qwen38_flash_next_continuation_layout_test qwen38_flash_next_mtp_sampling_test
-  qwen38_flash_next_probe_test qwen38_flash_next_rope_scaling_test qwen38_flash_next_runner_options_test
-  qwen3_asr_audio_api_test qwen3_asr_config_test qwen3_tts_audio_api_test
-  qwen3_tts_config_test qwen_chat_template_test qwen_image_21_test qwen_image_21_weights_test
-  qwen_tokenizer_test video_api_test
+  qwen27b_continuation_identity_test qwen27b_continuation_layout_test qwen38_flash_next_config_test
+  qwen38_flash_next_continuation_identity_test qwen38_flash_next_continuation_layout_test
+  qwen38_flash_next_mtp_sampling_test qwen38_flash_next_probe_test qwen38_flash_next_rope_scaling_test
+  qwen38_flash_next_runner_options_test qwen3_asr_audio_api_test qwen3_asr_config_test
+  qwen3_tts_audio_api_test qwen3_tts_config_test qwen_chat_template_test qwen_image_21_lora_test
+  qwen_image_21_test qwen_image_21_weights_test qwen_tokenizer_test video_api_test
+  qwen36_35b_a3b_config_test
   # END GENERATED MODEL PR TARGETS
 )
 set(gufo_pr_tests ${gufo_pr_targets})
@@ -51,14 +53,15 @@ if(NOT WIN32)
 endif()
 # BEGIN GENERATED MODEL CTEST OVERRIDES
 list(REMOVE_ITEM gufo_pr_tests
-  ds4_chat_template_test ds4_cli_test ds4_sampling_test qwen36_35b_a3b_config_test
-  qwen38_flash_next_config_test qwen38_flash_next_continuation_layout_test
-  qwen38_flash_next_mtp_sampling_test qwen38_flash_next_probe_test qwen38_flash_next_rope_scaling_test
-  qwen38_flash_next_runner_options_test)
+  ds4_chat_template_test ds4_cli_test ds4_sampling_test qwen38_flash_next_config_test
+  qwen38_flash_next_continuation_layout_test qwen38_flash_next_mtp_sampling_test
+  qwen38_flash_next_probe_test qwen38_flash_next_rope_scaling_test qwen38_flash_next_runner_options_test
+  qwen36_35b_a3b_config_test)
 list(APPEND gufo_pr_tests
-  "ds4\.template" "ds4\.cli" "ds4\.sampling" "qwen36_35b_a3b\.config"
-  "qwen38_flash_next\.config" "qwen38_flash_next\.continuation_layout" "qwen38_flash_next\.mtp_sampling"
-  "qwen38_flash_next\.probe" "qwen38_flash_next\.rope_scaling" "qwen38_flash_next\.runner_options")
+  "ds4\.template" "ds4\.cli" "ds4\.sampling" "qwen38_flash_next\.config"
+  "qwen38_flash_next\.continuation_layout" "qwen38_flash_next\.mtp_sampling"
+  "qwen38_flash_next\.probe" "qwen38_flash_next\.rope_scaling" "qwen38_flash_next\.runner_options"
+  "qwen36_35b_a3b\.config")
 # END GENERATED MODEL CTEST OVERRIDES
 list(APPEND gufo_pr_tests
   gufo_version gufo_help serve_cli_test eval_http_test functional_runner_test

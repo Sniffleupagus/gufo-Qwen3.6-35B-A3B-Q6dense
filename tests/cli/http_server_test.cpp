@@ -339,6 +339,31 @@ void TestFramingAndMetrics() {
   }
   ExpectStatus(server.Send("POST /echo\r\n\r\n"), 400);
   ExpectStatus(server.Send("POST /echo HTTP/1.1 extra\r\n\r\n"), 400);
+  // RFC 9112 2.2: a bare LF ends a line and one empty line before the request
+  // line is ignored; the request line needs single spaces and a token
+  // method, and field values no control bytes.
+  ExpectStatus(server.Send("GET /health HTTP/1.1\nHost: a\n\n"), 200);
+  ExpectStatus(server.Send("\r\nGET /health HTTP/1.1\r\n\r\n"), 200);
+  using std::string_view_literals::operator""sv;
+  for (const std::string_view request :
+       {"GET  /health HTTP/1.1\r\n\r\n"sv, "GET\t/health HTTP/1.1\r\n\r\n"sv,
+        "G@T /health HTTP/1.1\r\n\r\n"sv,
+        "GET /health HTTP/1.1\r\nX: a\x01"
+        "b\r\n\r\n"sv,
+        "GET /health HTTP/1.1\r\nX: a\0b\r\n\r\n"sv,
+        "\r\n\r\nGET /health HTTP/1.1\r\n\r\n"sv}) {
+    ExpectStatus(server.Send(request, true), 400);
+  }
+  // At most 100 header fields; more get 431 (RFC 6585 5).
+  std::string fields;
+  for (int i = 0; i < 100; ++i) {
+    fields += "X-" + std::to_string(i) + ": v\r\n";
+  }
+  ExpectStatus(server.Send("GET /health HTTP/1.1\r\n" + fields + "\r\n"), 200);
+  const auto too_many =
+      server.Send("GET /health HTTP/1.1\r\n" + fields + "X: v\r\n\r\n");
+  ExpectStatus(too_many, 431);
+  assert(too_many.find("request_header_fields_too_large") != std::string::npos);
   ExpectStatus(
       server.Send("POST /echo HTTP/1.1\r\nContent-Length: 4\r\n\r\nx", true),
       400);
@@ -901,6 +926,23 @@ void TestLlamaSlotsAndMetrics() {
            std::string::npos);
   }
   assert(metrics.find("# TYPE llamacpp:kv_cache_usage_ratio gauge\n") !=
+         std::string::npos);
+  // A backend that publishes its prompt-state admission budget exposes it
+  // beside the KV ratio; a backend without one emits no budget gauges.
+  server.backend->prompt_budget =
+      gufo::server::TextGenerationBackend::PromptAdmissionBudget{
+          .budget_bytes = 4096,
+          .used_bytes = 1024,
+          .available_bytes = 3072,
+      };
+  const auto budget_metrics = get("/metrics");
+  assert(budget_metrics.find("gufo_prompt_state_budget_bytes 4096\n") !=
+         std::string::npos);
+  assert(budget_metrics.find("gufo_prompt_state_reserved_bytes 1024\n") !=
+         std::string::npos);
+  assert(budget_metrics.find("gufo_prompt_state_available_bytes 3072\n") !=
+         std::string::npos);
+  assert(budget_metrics.find("# TYPE gufo_prompt_state_budget_bytes gauge\n") !=
          std::string::npos);
 }
 
@@ -2218,6 +2260,44 @@ void TestGenerationFailureLogsCause() {
   assert(count("event=server_exception reason=context exceeded") == 3);
   // After streaming starts, each endpoint logs it once beside its stable code.
   assert(count("[ERROR] [chat] context exceeded") == 3);
+}
+
+void TestPromptMemoryRefusalDetails() {
+  RunningServer server;
+  server.backend->reject_memory = true;
+  for (const bool stream : {false, true}) {
+    for (const auto* path : {"/v1/completions", "/v1/chat/completions",
+                             "/v1/responses", "/v1/messages"}) {
+      auto request = gufo::json::parse(R"({"model":"test"})");
+      const std::string_view endpoint(path);
+      if (endpoint == "/v1/completions") {
+        request["prompt"] = "hello";
+        request["max_tokens"] = 8;
+      } else if (endpoint == "/v1/responses") {
+        request["input"] = "hello";
+        request["max_output_tokens"] = 8;
+      } else {
+        request["messages"] =
+            gufo::json::parse(R"([{"role":"user","content":"hi"}])");
+        request[endpoint == "/v1/messages" ? "max_tokens"
+                                           : "max_completion_tokens"] = 8;
+      }
+      request["stream"] = stream;
+      const auto response = server.Post(path, request.dump());
+      ExpectStatus(response, 503);
+      assert(response.find("Retry-After: 1") != std::string::npos);
+      const auto body =
+          gufo::json::parse(response.substr(response.find("\r\n\r\n") + 4));
+      const auto* error = body.find("error");
+      assert(error && error->member_str("code") == "insufficient_memory" &&
+             error->member_size("required_bytes") == 4096 &&
+             error->member_size("remaining_bytes") == 512);
+      const auto* usage = body.find("usage");
+      const auto* details = usage ? usage->find("gufo") : nullptr;
+      assert(details && details->member_size("required_bytes") == 4096 &&
+             details->member_size("remaining_bytes") == 512);
+    }
+  }
 }
 
 void TestDeviceLoss() {
@@ -3581,6 +3661,7 @@ int main() {
   TestServedModelNames();
   TestRawCompletionStreaming();
   TestGenerationFailureLogsCause();
+  TestPromptMemoryRefusalDetails();
   TestDeviceLoss();
   TestDeviceLossWhileWriterBlocked();
   TestRawCompletionLogprobs();

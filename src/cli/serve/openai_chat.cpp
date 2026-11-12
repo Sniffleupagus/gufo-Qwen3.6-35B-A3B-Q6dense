@@ -269,26 +269,6 @@ const char* StatusReason(int status) noexcept {
   }
 }
 
-HttpResponse GenerationError(const TextGenerationError& exception) {
-  json::Value response = json::Value::object();
-  json::Value error = json::Value::object();
-  error["message"] = exception.what();
-  error["type"] = "server_error";
-  error["code"] = exception.stable_code();
-  response["error"] = std::move(error);
-  HttpResponse output{
-      .status = exception.http_status(),
-      .reason = StatusReason(exception.http_status()),
-      .body = response.dump(),
-      .headers = {},
-      .streaming_body = {},
-  };
-  if (exception.retryable()) {
-    output.headers.emplace_back("Retry-After", "1");
-  }
-  return output;
-}
-
 bool IsKnownRole(std::string_view role) {
   return role == "system" || role == "developer" || role == "user" ||
          role == "assistant" || role == "tool";
@@ -418,13 +398,17 @@ bool ParseArguments(std::string_view arguments,
     *error = "tool arguments must encode a JSON object";
     return false;
   }
-  // Render typed values as the reference chat templates' tojson does (and as
-  // llama.cpp's Jinja runtime does), so a replayed call matches the tokens
-  // the model generated and its continuation checkpoint is reused.
+  // Render typed values as the reference chat templates' tojson does, so a
+  // replayed call matches the tokens the model generated and its continuation
+  // checkpoint is reused. Numbers keep the client's spelling: the one this
+  // server returned, as the model generated it. llama.cpp's Jinja runtime
+  // writes floats from their double (1.0 as 1) and misses those turns.
   for (const auto& [name, value] : parsed.members()) {
     out->push_back({
         .name = name,
-        .value = value.is_string() ? value.get_str() : value.tojson(),
+        .value = value.is_string()
+                     ? value.get_str()
+                     : value.tojson(json::Value::Numbers::kAsParsed),
         .is_string = value.is_string(),
     });
   }
@@ -1378,8 +1362,13 @@ std::size_t FramingHold(std::string_view full, std::size_t end,
   return hold;
 }
 
+// Numbers keep the spelling the model generated, as llama.cpp returns them:
+// above 2^53, and 1.0 or 1e5, a double would change the client's arguments
+// and the replayed turn. Schema checks pass kCanonical, which the native
+// number grammar reads.
 std::string ArgumentsJson(
-    std::span<const tokenization::ChatMessage::ToolArgument> arguments) {
+    std::span<const tokenization::ChatMessage::ToolArgument> arguments,
+    json::Value::Numbers numbers = json::Value::Numbers::kAsParsed) {
   json::Value object = json::Value::object();
   for (const auto& argument : arguments) {
     if (argument.is_string) {
@@ -1392,7 +1381,7 @@ std::string ArgumentsJson(
       object[argument.name] = argument.value;
     }
   }
-  return object.dump();
+  return object.dump(numbers);
 }
 
 // Qwen's XML-like arguments carry no type marker. The advertised schema is
@@ -1675,7 +1664,9 @@ void ParseQwenCalls(
           for (const auto& [name, value] : arguments->members())
             call.arguments.push_back(
                 {.name = name,
-                 .value = value.is_string() ? value.get_str() : value.dump(),
+                 .value = value.is_string()
+                              ? value.get_str()
+                              : value.dump(json::Value::Numbers::kAsParsed),
                  .is_string = value.is_string()});
           complete = true;
         }
@@ -1697,7 +1688,8 @@ void ParseQwenCalls(
           const auto grammar = sampling::JsonConstraint::Compile(
               json::parse(tool->parameters_json), false);
           auto state = grammar->Start();
-          for (const unsigned char byte : ArgumentsJson(call.arguments))
+          for (const unsigned char byte :
+               ArgumentsJson(call.arguments, json::Value::Numbers::kCanonical))
             state = grammar->Advance(state, byte);
           complete = grammar->Complete(state);
         } catch (const std::exception&) {
@@ -2224,7 +2216,9 @@ json::Value Usage(const TextGenerationBackend::Result& result) {
   metrics["cache_restore_bytes"] = result.cache_restore_bytes;
   metrics["cache_snapshot_bytes"] = result.cache_snapshot_bytes;
   metrics["cache_disk_queued_bytes"] = result.cache_disk_queued_bytes;
-  metrics["cache_shared_bytes"] = result.cache_shared_bytes;
+  // Deprecated compatibility key; remove at the next breaking release.
+  // See src/deprecated-items-to-remove-at-breaking-release.md.
+  metrics["cache_shared_bytes"] = std::size_t{0};
   metrics["cache_restore_ms"] = result.cache_restore_ms;
   metrics["cache_snapshot_ms"] = result.cache_snapshot_ms;
   metrics["cache_disk_enqueue_ms"] = result.cache_disk_enqueue_ms;
@@ -4087,6 +4081,42 @@ HttpResponse CreateCompatibilityResponse(
 
 }  // namespace
 
+HttpResponse TextGenerationErrorResponse(const TextGenerationError& exception) {
+  json::Value response = json::Value::object();
+  json::Value error = json::Value::object();
+  error["message"] = exception.what();
+  error["type"] = "server_error";
+  error["code"] = exception.stable_code();
+  if (exception.required_bytes().has_value())
+    error["required_bytes"] = *exception.required_bytes();
+  if (exception.remaining_bytes().has_value())
+    error["remaining_bytes"] = *exception.remaining_bytes();
+  response["error"] = std::move(error);
+  if (exception.required_bytes().has_value() ||
+      exception.remaining_bytes().has_value()) {
+    json::Value gufo = json::Value::object();
+    gufo["code"] = exception.stable_code();
+    if (exception.required_bytes().has_value())
+      gufo["required_bytes"] = *exception.required_bytes();
+    if (exception.remaining_bytes().has_value())
+      gufo["remaining_bytes"] = *exception.remaining_bytes();
+    json::Value usage = json::Value::object();
+    usage["gufo"] = std::move(gufo);
+    response["usage"] = std::move(usage);
+  }
+  HttpResponse output{
+      .status = exception.http_status(),
+      .reason = StatusReason(exception.http_status()),
+      .body = response.dump(),
+      .headers = {},
+      .streaming_body = {},
+  };
+  if (exception.retryable()) {
+    output.headers.emplace_back("Retry-After", "1");
+  }
+  return output;
+}
+
 HttpResponse CreateOpenAiResponse(const HttpRequest& request,
                                   TextGenerationBackend& backend,
                                   const ChatRequest& chat,
@@ -4128,7 +4158,7 @@ HttpResponse HandleOpenAiChat(const HttpRequest& request,
     return NonStreamingResponse(parsed, backend, generation,
                                 initial_output_state);
   } catch (const TextGenerationError& exception) {
-    return GenerationError(exception);
+    return TextGenerationErrorResponse(exception);
   } catch (const std::invalid_argument& exception) {
     return Error(400, "Bad Request", exception.what(), "invalid_prompt");
   } catch (const std::length_error& exception) {
@@ -4158,7 +4188,7 @@ HttpResponse CountOpenAiInputTokens(const ChatRequest& chat,
     counted.body = response.dump();
     return counted;
   } catch (const TextGenerationError& exception) {
-    return GenerationError(exception);
+    return TextGenerationErrorResponse(exception);
   } catch (const std::invalid_argument& exception) {
     return Error(400, "Bad Request", exception.what(), "invalid_prompt");
   } catch (const std::length_error& exception) {

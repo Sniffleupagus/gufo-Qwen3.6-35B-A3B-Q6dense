@@ -496,8 +496,9 @@ void TestPrimitiveConstraints() {
   const auto pattern = compile(
       R"({"type":"string","pattern":"^@[a-zA-Z0-9_]+$","maxLength":6})");
   const auto positive = compile(R"({"type":"number","exclusiveMinimum":0})");
+  // The 16th decimal is the last one: it must complete the number.
   auto number_state = positive->Start();
-  for (unsigned char byte : std::string("{\"x\":0.") + std::string(4093, '0'))
+  for (unsigned char byte : std::string("{\"x\":0.") + std::string(15, '0'))
     number_state = positive->Advance(number_state, byte);
   assert(!number_state.empty());
   assert(positive->Advance(number_state, '0').empty());
@@ -760,7 +761,13 @@ void TestIntegerBoundsAndRecursion() {
   const auto large = scalar(R"("exclusiveMinimum":9007199254740992)");
   assert(!Accepts(*large, "{\"x\":9007199254740992}"));
   assert(Accepts(*large, "{\"x\":9007199254740993}"));
-  assert(Accepts(*large, "{\"x\":1000000000000000000000000000000000}"));
+  // An open upper end stops at llama.cpp's 16 digits.
+  assert(Accepts(*large, "{\"x\":9999999999999999}"));
+  assert(!Accepts(*large, "{\"x\":10000000000000000}"));
+  const auto huge = scalar(R"("minimum":1e20)");
+  assert(Accepts(*huge, "{\"x\":100000000000000000000}"));
+  assert(!Accepts(*huge, "{\"x\":99999999999999999999}"));
+  assert(!Accepts(*huge, "{\"x\":1000000000000000000000}"));
   const auto negative = scalar(R"("exclusiveMaximum":-9007199254740992)");
   assert(!Accepts(*negative, "{\"x\":-9007199254740992}"));
   assert(Accepts(*negative, "{\"x\":-9007199254740993}"));
@@ -1562,8 +1569,9 @@ void TestOpenNativeTools() {
 }
 
 void TestNonStrictAgentTools() {
-  // Pi's ordinary edit schema leaves nested objects open. This must not switch
-  // the entire tool set to JSON or alter the model's native chat template.
+  // Pi's ordinary edit schema omits nested additionalProperties. This must not
+  // switch the entire tool set to JSON or alter the model's native chat
+  // template.
   const auto schema = parse(R"({"type":"object","properties":{
     "path":{"type":"string"},
     "edits":{"type":"array","items":{"type":"object","properties":{
@@ -1628,7 +1636,7 @@ void TestNonStrictAgentTools() {
       auto extra = call;
       extra.replace(extra.find(edits), edits.size(),
                     R"([{"oldText":"a","newText":"b","note":{"line":3}}])");
-      assert(Accepts(*grammar, extra));
+      assert(!Accepts(*grammar, extra));
       auto missing = call;
       const auto edits_begin = missing.find(
           format == Format::kQwen ? "<parameter=edits>"
@@ -2382,7 +2390,7 @@ void TestLlamaCppToolGrammarGoldens() {
     ++rows;
     differences += explained;
   }
-  assert(rows == 688 && differences < rows / 5);
+  assert(rows == 792 && differences < rows / 5);
 }
 
 // An invented native syntax, absent from ToolFormat, with non-JSON value
@@ -2771,6 +2779,218 @@ void TestQwenFrameNewlineIsNotACloser() {
   }
 }
 
+// #1126: an escaped quote in a hallucinated extra key let repeated }]
+// remain viable string contents until max_tokens. Match llama.cpp's default
+// for objects with declared properties, including inside native parameters.
+void TestNestedToolObjectDefaults() {
+  const auto schema = parse(R"({"type":"object","properties":{
+    "revision":{"type":"string"},
+    "files":{"type":"array","items":{"type":"object","properties":{
+      "end_line":{"type":"integer"},"path":{"type":"string"},
+      "start_line":{"type":"integer"}},"required":["path"]}}},
+    "required":["revision","files"]})");
+  using Format = JsonConstraint::ToolFormat;
+  for (const auto format : {Format::kJson, Format::kQwen, Format::kDeepSeek}) {
+    for (const bool extras : {false, true}) {
+      auto parameters = schema;
+      if (extras)
+        parameters["properties"]["files"]["items"]["additionalProperties"] =
+            true;
+      const auto grammar =
+          JsonConstraint::ToolParameters(parameters, false, format);
+      const auto argument = [&](std::string_view files) {
+        if (format == Format::kQwen)
+          return "<parameter=revision>\nabc\n</"
+                 "parameter>\n<parameter=files>\n" +
+                 std::string(files) + "\n</parameter>\n";
+        if (format == Format::kDeepSeek)
+          return "<｜DSML｜parameter name=\"revision\" string=\"true\">abc"
+                 "</｜DSML｜parameter>\n<｜DSML｜parameter name=\"files\" "
+                 "string=\"false\">" +
+                 std::string(files) + "</｜DSML｜parameter>\n";
+        return "{\"revision\":\"abc\",\"files\":" + std::string(files) + "}";
+      };
+      assert(Accepts(*grammar, argument(R"([{"path":"a"}])")));
+      assert(
+          Accepts(*grammar,
+                  argument(R"([{"end_line":100,"path":"a","start_line":1}])")));
+      assert(Accepts(*grammar, argument(R"([{"path":"a","note":1}])")) ==
+             extras);
+      // Schema order and llama.cpp's order (required first, then optional
+      // properties in schema order) are both accepted; other orders are not.
+      assert(
+          Accepts(*grammar,
+                  argument(R"([{"path":"a","end_line":100,"start_line":1}])")));
+      assert(!Accepts(
+          *grammar,
+          argument(R"([{"path":"a","start_line":1,"end_line":100}])")));
+      assert(!Accepts(*grammar, argument(R"([{"start_line":1,"path":"a"}])")));
+      auto state = grammar->Start();
+      // The actual failing key follows path/start_line, after the optional
+      // end_line slot. It must be rejected before an unbounded string begins.
+      const std::string broken =
+          R"([{"path":"a","start_line":1,"end_line\":100}]}]}])";
+      auto malformed = argument(broken);
+      malformed.resize(malformed.find(broken) + broken.size());
+      for (const unsigned char byte : malformed)
+        state = grammar->Advance(state, byte);
+      assert(state.empty() == !extras);
+    }
+  }
+}
+
+// Issue #1166: Flash-Next wrote "start_line": 114000... until the token
+// limit. llama.cpp's integral-part and decimal-part allow at most 16 digits.
+void TestNumberDigitLimits() {
+  const auto field = [](std::string_view schema) {
+    return JsonConstraint::Compile(
+        parse(R"({"type":"object","properties":{"x":)" + std::string(schema) +
+              R"(},"required":["x"],"additionalProperties":false})"),
+        true);
+  };
+  const auto accepts = [](const JsonConstraint& grammar, std::string value) {
+    return Accepts(grammar, "{\"x\":" + value + "}");
+  };
+  const auto digits = [](std::size_t count) {
+    return "1" + std::string(count - 1, '0');
+  };
+  const auto fraction = [](std::size_t count) {
+    return "0." + std::string(count, '1');
+  };
+  for (const std::string_view schema :
+       {R"({"type":"integer"})", R"({"type":"number"})",
+        R"({"type":"integer","minimum":1})", R"({"type":"number","minimum":0})",
+        R"({"type":"integer","maximum":0})",
+        R"({"type":"integer","multipleOf":1})"}) {
+    const auto grammar = field(schema);
+    const std::string sign =
+        schema.find("maximum") != std::string_view::npos ? "-" : "";
+    assert(accepts(*grammar, sign + digits(16)));
+    assert(!accepts(*grammar, sign + digits(17)));
+    if (schema.find("integer") != std::string_view::npos)
+      continue;
+    assert(accepts(*grammar, fraction(16)));
+    assert(!accepts(*grammar, fraction(17)));
+  }
+  // Untyped tool values use the same number rule.
+  const auto untyped = JsonConstraint::ToolParameters(
+      parse(R"({"type":"object","properties":{"x":{}},"required":["x"]})"),
+      false, JsonConstraint::ToolFormat::kJson);
+  assert(accepts(*untyped, digits(16)));
+  assert(!accepts(*untyped, digits(17)));
+  assert(accepts(*untyped, fraction(16)));
+  assert(!accepts(*untyped, fraction(17)));
+  const auto number = field(R"({"type":"number"})");
+  assert(accepts(*number, "1e0"));
+  assert(accepts(*number, "1E-" + std::string(16, '9')));
+  assert(!accepts(*number, "1e" + std::string(17, '9')));
+  assert(!accepts(*number, "1e05"));
+  // Bounds and multipleOf that need longer values widen the lexeme's caps by
+  // one digit past the bound, which leaves room for exclusive bounds.
+  const auto tiny =
+      field(R"({"type":"number","exclusiveMinimum":0,"maximum":1e-20})");
+  assert(accepts(*tiny, "0.00000000000000000001"));
+  assert(accepts(*tiny, "0.000000000000000000005"));
+  assert(!accepts(*tiny, "0.0000000000000000000005"));
+  const auto big = field(R"({"type":"number","minimum":1e20})");
+  assert(accepts(*big, digits(21)));
+  assert(accepts(*big, digits(22)));
+  assert(!accepts(*big, digits(23)));
+
+  const auto parameters = parse(R"({"type":"object","properties":{
+    "files":{"type":"array","items":{"type":"object","properties":{
+      "end_line":{"type":"integer"},"path":{"type":"string"},
+      "start_line":{"type":"integer"}},"required":["path"]}},
+    "revision":{"type":"string"}},"required":["revision","files"]})");
+  const auto tool = JsonConstraint::ToolParameters(
+      parameters, false, JsonConstraint::ToolFormat::kQwen);
+  const std::string prefix =
+      "<parameter=revision>\n866b7e81f59cc7f2597d29295bc9c487f3e3a9b9\n"
+      "</parameter>\n<parameter=files>\n"
+      R"([{"path": "static/index.html", "start_line": )";
+  auto state = tool->Start();
+  for (const unsigned char byte : prefix + digits(16))
+    state = tool->Advance(state, byte);
+  assert(!state.empty());
+  assert(tool->Advance(state, '0').empty());
+  assert(Accepts(*tool, prefix + "1140}]\n</parameter>\n"));
+}
+
+// Nested objects accept schema order and llama.cpp's order (required members
+// first, then optional ones in schema order), and no other order.
+void TestObjectMemberOrders() {
+  const auto in_order = [](const std::vector<int>& keys,
+                           const std::vector<int>& order,
+                           const std::vector<bool>& required) {
+    std::size_t i = 0;
+    for (const int key : keys) {
+      for (; i < order.size() && order[i] != key; ++i)
+        if (required[order[i]])
+          return false;
+      if (i++ == order.size())
+        return false;
+    }
+    for (; i < order.size(); ++i)
+      if (required[order[i]])
+        return false;
+    return true;
+  };
+  using Format = JsonConstraint::ToolFormat;
+  constexpr int n = 4;
+  for (unsigned pattern = 0; pattern < (1u << n); ++pattern) {
+    std::vector<bool> required(n);
+    auto item = gufo::json::Value::object();
+    item["type"] = "object";
+    item["properties"] = gufo::json::Value::object();
+    item["required"] = gufo::json::Value::array();
+    std::vector<int> schema_order, llama_order;
+    for (int i = 0; i < n; ++i) {
+      const auto name = "k" + std::to_string(i);
+      item["properties"][name] = parse(R"({"type":"integer"})");
+      required[i] = pattern >> i & 1;
+      if (required[i]) {
+        item["required"].push_back(name);
+        llama_order.push_back(i);
+      }
+      schema_order.push_back(i);
+    }
+    for (int i = 0; i < n; ++i)
+      if (!required[i])
+        llama_order.push_back(i);
+    auto schema = parse(R"({"type":"object","required":["o"]})");
+    schema["properties"] = gufo::json::Value::object();
+    schema["properties"]["o"] = item;
+    for (const auto format :
+         {Format::kJson, Format::kQwen, Format::kDeepSeek}) {
+      const auto grammar =
+          JsonConstraint::ToolParameters(schema, false, format);
+      for (unsigned subset = 0; subset < (1u << n); ++subset) {
+        std::vector<int> keys;
+        for (int i = 0; i < n; ++i)
+          if (subset >> i & 1)
+            keys.push_back(i);
+        do {
+          std::string object = "{";
+          for (const int key : keys)
+            object += (object.size() > 1 ? ",\"k" : "\"k") +
+                      std::to_string(key) + "\":1";
+          object += "}";
+          const auto text =
+              format == Format::kQwen
+                  ? "<parameter=o>\n" + object + "\n</parameter>\n"
+              : format == Format::kDeepSeek
+                  ? "<｜DSML｜parameter name=\"o\" string=\"false\">" + object +
+                        "</｜DSML｜parameter>\n"
+                  : "{\"o\":" + object + "}";
+          assert(Accepts(*grammar, text) ==
+                 (in_order(keys, schema_order, required) ||
+                  in_order(keys, llama_order, required)));
+        } while (std::ranges::next_permutation(keys).found);
+      }
+    }
+  }
+}
+
 int main(int argc, char** argv) {
   // Batch probes for the independent Python JSON Schema validator. This
   // exercises the production byte matcher without requiring model weights.
@@ -2804,6 +3024,9 @@ int main(int argc, char** argv) {
     }
     return 0;
   }
+  TestNestedToolObjectDefaults();
+  TestNumberDigitLimits();
+  TestObjectMemberOrders();
   TestJsonLanguage();
   TestSchemaLanguage();
   TestSchemaIntersections();

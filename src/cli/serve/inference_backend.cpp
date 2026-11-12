@@ -159,7 +159,7 @@ struct InferenceBackend::Impl {
       bool cache_prompt = true, std::size_t cache_prefix_tokens = 0,
       const std::vector<std::string>& stop_sequences = {},
       InitialOutputState initial = InitialOutputState::kContent,
-      bool cache_persist = true) const {
+      bool cache_persist = true, bool chat_template = false) const {
     Result result;
     result.prompt_tokens = prompt_tokens.size();
     result.client_id = client_id.empty() ? "anonymous" : client_id;
@@ -183,6 +183,7 @@ struct InferenceBackend::Impl {
             .cache_persist = cache_persist,
             .cache_prefix_tokens = cache_prefix_tokens,
             .stop_sequences = stop_sequences,
+            .chat_template = chat_template,
         });
     ScheduledGenerationRequest generation(std::move(current),
                                           std::move(request), initial);
@@ -400,6 +401,25 @@ std::vector<InferenceBackend::SessionState> InferenceBackend::session_states()
 #endif
 }
 
+std::optional<InferenceBackend::PromptAdmissionBudget>
+InferenceBackend::prompt_admission_budget() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr)
+    return std::nullopt;
+  auto budget = state->scheduler->PromptAdmissionBudgetSnapshot();
+  if (!budget.has_value())
+    return std::nullopt;
+  return PromptAdmissionBudget{
+      .budget_bytes = budget->budget_bytes,
+      .used_bytes = budget->used_bytes,
+      .available_bytes = budget->available_bytes,
+  };
+#else
+  return std::nullopt;
+#endif
+}
+
 InferenceBackend::SamplingDefaults InferenceBackend::sampling_defaults() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -584,7 +604,7 @@ InferenceBackend::Result InferenceBackend::chat(
       effective_sampling, is_cancelled, on_token, request.client_id,
       std::move(prompt->context), request.cache_prompt,
       prompt->cache_prefix_tokens, request.stop_sequences, initial,
-      request.cache_persist);
+      request.cache_persist, true);
 #else
   (void)request;
   (void)max_tokens;
@@ -685,6 +705,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
           .cache_prefix_tokens = prompt->cache_prefix_tokens,
           .stop_sequences = request.stop_sequences,
           .return_progress = request.return_progress,
+          .chat_template = true,
       });
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request), initial, tool_format,

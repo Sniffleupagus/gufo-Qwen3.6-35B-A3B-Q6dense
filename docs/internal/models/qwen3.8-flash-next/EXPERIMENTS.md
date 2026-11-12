@@ -1,5 +1,99 @@
 # Qwen3.8 Flash-Next experiments
 
+## Host CPU paths (November 9, 2026)
+
+Retained the ideas from [Youry Metlitsky's issue #716 patches](https://github.com/gufo-org/gufo/issues/716):
+runtime AVX-512 block maxima, IQ4_NL codebook lookups and BF16 widening,
+plus division-free n-gram hashing. The current sampler shares its block scan
+through `sampling_logit_row.hpp`; the existing Q8_0 table path is preserved.
+
+The adaptation caches reciprocals by divisor value, avoiding stale results
+when a Config changes or its address is reused. A rounded-up 64-bit
+reciprocal and one wrap correction suffice for the actual nonzero 32-bit
+head vocabularies. GNU x86 compiler guards retain the scalar SIMD fallbacks;
+compilers without 128-bit integers retain the original hash loop. BF16 uses
+an explicitly unaligned load and needs only AVX-512F, not AVX-512BW.
+
+The CPU measurements below improve all four isolated operations. [Exact operator checks and real API replay](QUALITY.md#cpu-serving-paths-november-9-2026)
+retain the arithmetic and outputs. Concurrent Qwen 27B snapshot timing is
+variable on unchanged main too; no end-to-end speedup is claimed.
+
+### CPU measurements, November 9, 2026
+
+Main `6a021263` versus the issue #716 adaptation, Strix Halo, pinned Nix
+GCC 16.2.0, `-O2`, baseline x86-64 ISA with runtime AVX-512 dispatch.
+Medians of three isolated measurements; these exclude disk reads, scheduling
+and GPU inference. The small row buffers rotate over 4,096 rows; the
+180 MiB control traverses 2,097,152 compressed rows in a permuted order.
+
+| Operation | Main | Candidate | Speedup |
+| --- | ---: | ---: | ---: |
+| Block maxima over 248,320 logits | 26.455 µs | 11.041 µs | 2.40× |
+| IQ4_NL row, 160 values, small buffer | 208.697 ns | 8.279 ns | 25.21× |
+| IQ4_NL row, 160 values, 180 MiB buffer | 370.770 ns | 98.047 ns | 3.78× |
+| N-gram hash, one token | 22.394 ns | 19.170 ns | 1.17× |
+| N-gram hash, 2,048 tokens | 60.570 µs | 30.368 µs | 1.99× |
+| BF16 row conversion, 160 values | 40.751 ns | 3.706 ns | 11.00× |
+
+Raw samples, compiler/build identities, harness sources, request histories
+and production controls are retained in
+`/home/fbozzo/projects/validation/issue716-20261109/`.
+These CPU speedups do not establish an end-to-end inference speedup.
+
+Production controls use `gufo bench -p 2048 -n 128 -d 0,4096 -r 2`,
+UD-Q4_K_XL revision `d96201` and the shared-Q8_0 MTP sidecar. Rates are the
+standard benchmark's two-repeat observations, not an HTTP timing qualification.
+
+| Mode | Depth | Main pp (tok/s) | Candidate pp (tok/s) | Main tg (tok/s) | Candidate tg (tok/s) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| AR | 0 | 1,948.15 | 1,945.50 | 30.43 | 30.46 |
+| AR | 4,096 | 1,883.25 | 1,886.34 | 29.69 | 29.73 |
+| MTP | 0 | 1,848.43 | 1,886.01 | 62.98 | 62.98 |
+| MTP | 4,096 | 1,772.28 | 1,805.25 | 51.82 | 51.89 |
+| AR sampled | 0 | 1,949.23 | 1,945.87 | 30.29 | 30.34 |
+| MTP sampled | 0 | 1,887.67 | 1,886.35 | 50.45 | 50.44 |
+
+Sampled controls use temperature 0.7, top-k 20, top-p 0.8 and seed 73.
+The greedy MTP prefill difference is about 2%; the matched decode rates are
+essentially unchanged. This does not establish a general inference speedup.
+
+## Prefill bounds on ROCm 10.1 (November 9, 2026)
+
+Main `017e9249`, ROCm 10.1, UD-Q4_K_XL (`d96201`), autoregressive,
+`gufo bench -n 0 -r 3`: pp512 1,350, pp2048 1,945, pp4096 2,020, pp16384
+1,965 tok/s; with the MTP sidecar 1,312 / 1,883 / 1,952. Every change below
+is exact (identical output hashes) and none is retained.
+`tools/bench/gfx1151_peak.hip` on this host: F16 WMMA 54.8 TFLOPS, DRAM read
+241 GB/s.
+
+`routed_gemm_bench` replaying the per-layer expert counts of a real pass
+(ms per pass over 48 layers, gate/up + down):
+
+| Pass rows | Tiles per layer | Rows per tile | Production | One cache-resident expert | Cache-resident activations |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 512 | 260 | 19 | 112 + 78 | 73 + 42 | 107 + 76 |
+| 2,048 | 408 | 49 | 212 + 145 | 190 + 106 | 203 + 141 |
+| 4,096 | 567 | 71 | 353 + 225 | 338 + 186 | 342 + 219 |
+
+The routed experts are DRAM-bound only at 512 rows (about 200 GB/s). From
+2,048 rows they are bound by WMMA time and weight decode: without any weight
+traffic they keep 83 % of their time. Buckets padded to 16 tokens execute
+1.54 / 1.18 / 1.08 times the useful WMMA work at 512 / 2,048 / 4,096 rows.
+The earlier "DRAM floor" for a pp2048 pass does not hold.
+
+| Experiment | Outcome |
+| --- | --- |
+| Both side streams off beside the fused DeltaNet | Rejected: without the shared-expert overlap pp512/2048/4096/16384 1,350/1,949/2,021/1,969 → 1,320/1,930/1,995/1,939; without the Z overlap 1,343/1,947/2,021/1,968. The measurement the fused DeltaNet section left open. |
+| 16 KiB of LDS for the routed kernels (no padding slot per activation plane or output row) | Rejected: occupancy is VGPR-bound (9 waves per SIMD), so nothing is gained, and the power-of-two strides cost 30–40 % at 2,048 rows (gate/up 212 → 296 ms, down 145 → 186 ms). |
+| Next superblock's weights fetched two stages ahead, after the stage's activations so the commit does not wait for them | Rejected: 212.1 → 212.2 ms. Load latency is not what the gate/up kernel waits for. |
+| Tile-major block order (one block of every tile before the next row block) | Rejected: the down projection re-reads its activations, 145 → 296 ms at 2,048 rows. |
+| Expert tiles launched largest and smallest alternately | Rejected: in the bench the down projection gains 3.4 % at 2,048 and 6.3 % at 4,096 rows (sorted orders lose 6–8 % on gate/up), but beside the shared expert a pass is unchanged: 1,349/1,954/2,036/1,974 → 1,341/1,953/2,036/1,976, repeated 1,349/1,945/2,016/1,962 → 1,338/1,954/2,026/1,967. |
+| A residual-sized device copy (84 MB read and written) per SSM layer, as a stand-in for running the HC combines beside the dense GEMMs | Rejected before building it: queued on the main stream it costs pp2048 28 ms per pass, on a side stream beside the SSM projection 21 ms, and at 4,096 rows the same as serial. The dense GEMMs are not free of memory traffic, so splitting the pass to overlap the combines cannot pay. |
+
+`routed_gemm_bench` took the narrow 16/48-token route below 1,024 tokens,
+which prefill left in the mid-size pass change; it now takes the 128-token
+map for every pass above eight tokens.
+
 ## Raw completion fallback (November 4, 2026)
 
 Retained: capture the aligned prompt tail in-pass before retaining the exact

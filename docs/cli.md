@@ -103,7 +103,8 @@ the same distribution.
   ([Qwen3.8 Flash-Next](models/qwen3.8-flash-next.md)), `dspark`
   ([DeepSeek V4 Flash](models/deepseek-v4-flash.md)).
 - `--dflash-model`, `--mtp-model`, `--dspark-model`: the draft file.
-- `--draft-tokens`: most tokens proposed per step.
+- `--draft-tokens`, `--min-draft-tokens`, `--draft-policy`: deprecated and
+  ignored; they will be removed. Each model sets how many tokens it proposes.
 
 **Server scheduling and limits**
 
@@ -137,7 +138,9 @@ broken output, then delete the file: it holds whole conversations.
   the same models without a server. Models with an audio projector accept
   `--mmproj`.
 - **Images:** `gufo serve image --model DIR`; see
-  [Qwen-Image-2.1](models/qwen-image-2.1.md).
+  [Qwen-Image-2.1](models/qwen-image-2.1.md). Register LoRA adapters with
+  `--lora NAME=PATH`; requests select them by name
+  ([LoRA adapters](models/qwen-image-2.1.md#lora-adapters)).
 - **Video:** `gufo serve video` and `gufo video`; see
   [MiniMax H3](models/minimax-h3.md).
 - **Decisions:** `gufo serve decision --model PATH` answers at

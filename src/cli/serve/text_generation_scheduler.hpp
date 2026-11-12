@@ -85,6 +85,9 @@ public:
     bool stop_at_eos{true};
     std::vector<std::string> stop_sequences;
     bool return_progress{false};
+    /// A chat template rendered the prompt, trimming whitespace from the
+    /// edges of message content.
+    bool chat_template{false};
   };
 
   class Request {
@@ -138,6 +141,15 @@ public:
   [[nodiscard]] std::vector<SessionState> SessionStates() const;
   [[nodiscard]] std::size_t buffered_output_bytes() const noexcept;
   [[nodiscard]] std::size_t max_buffered_output_bytes() const noexcept;
+
+  struct PromptAdmissionBudget {
+    std::size_t budget_bytes{0};
+    std::size_t used_bytes{0};
+    std::size_t available_bytes{0};
+  };
+  /// Null when the runner does not publish prompt-state admission inputs.
+  [[nodiscard]] std::optional<PromptAdmissionBudget>
+  PromptAdmissionBudgetSnapshot() const;
 
   [[nodiscard]] Request Submit(std::vector<TextRunnerToken> prompt,
                                std::size_t max_tokens,
