@@ -1,4 +1,5 @@
 #include "src/models/qwen36_35b_a3b/config.hpp"
+#include "src/models/qwen36_35b_a3b/mtp_policy.hpp"
 
 #include <cstdint>
 #include <cstring>
@@ -245,12 +246,52 @@ void CheckMalformedMetadata() {
   }
 }
 
+// Upstream #912: a greedy batch cycle with profitable acceptance clears a
+// stale AR backoff, so the session drafts again once it decodes alone.
+void CheckBatchBackoffRecovery() {
+  q36::MtpLengthController ordinary(7, 2), recovered(7, 2);
+  auto state = ordinary.State();
+  state.successes.fill(8.0F);
+  state.failures.fill(0.5F);
+  state.retry_tokens = 13;
+  state.explored_depth = 3;
+  state.probe_delay = 10;
+  Require(ordinary.Restore(state) && recovered.Restore(state),
+          "backoff fixture was rejected");
+  ordinary.Observe(1, 1, 150);
+  recovered.Observe(1, 1, 150, true);
+  const auto a = ordinary.State(), b = recovered.State();
+  Require(a.retry_tokens == 13 && b.retry_tokens == 0,
+          "profitable batch evidence did not clear the stale backoff");
+  Require(a.successes == b.successes && a.failures == b.failures &&
+              a.probe_depth == b.probe_depth &&
+              a.explored_depth == b.explored_depth &&
+              a.probe_delay == b.probe_delay &&
+              a.failed_depths == b.failed_depths,
+          "backoff recovery changed acceptance or exploration history");
+  Require(ordinary.Choose(7, 150) == 0 && recovered.Choose(7, 150) != 0,
+          "recovered session did not resume drafting alone");
+
+  Require(recovered.Restore(state), "backoff fixture restore failed");
+  recovered.Observe(0, 0, 150, true);
+  Require(recovered.State().retry_tokens == 13,
+          "an empty observation cleared the AR interval");
+  state.successes.fill(0.001F);
+  state.failures.fill(1.0F);
+  Require(recovered.Restore(state), "poor acceptance state was rejected");
+  recovered.Observe(0, 1, 150, true);
+  Require(recovered.State().retry_tokens == 16 &&
+              recovered.Choose(7, 150) == 0,
+          "unprofitable batch evidence bypassed the backoff");
+}
+
 }  // namespace
 
 int main() {
   try {
     CheckValidMetadata();
     CheckMalformedMetadata();
+    CheckBatchBackoffRecovery();
   } catch (const std::exception& error) {
     std::cerr << "FAIL: " << error.what() << '\n';
     return 1;

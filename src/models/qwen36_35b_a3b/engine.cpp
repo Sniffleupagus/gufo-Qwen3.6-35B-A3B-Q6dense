@@ -625,6 +625,7 @@ struct Session::PendingDecode {
   MtpCandidateLogits candidates;
   std::int32_t draft{0};
   float draft_prob{1.0F};  ///< greedy `draft` probability under the head
+  bool planned_greedy{false};  ///< drafted at a jointly planned batch width
 };
 
 void Session::AppendDraft(PendingDecode& pending) {
@@ -687,6 +688,7 @@ bool Session::PrepareDecode(const DecodeRequest& request,
 
   const std::uint32_t base = static_cast<std::uint32_t>(tokens_.size());
   const bool sampled = sampler.config().uses_random_sampling();
+  pending->planned_greedy = batch_drafts.has_value() && !sampled;
   const bool gpu_greedy = sampler.config().temperature == 0.0F;
   const bool gpu_verification = gpu_greedy;
   // Greedy proposals run as one device-side chain: catch-up plus every
@@ -869,7 +871,8 @@ bool Session::FinishDecode(const DecodeRequest& request,
   stats_.accepted += keep - 1;
   // A target stop ends the request; it does not classify the remaining
   // proposals as failed predictions.
-  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base);
+  draft_length_.Observe(keep - 1, result->stop ? keep - 1 : k - 1, base,
+                        pending.planned_greedy);
 
   // The next call knows the next sampled anchor. Defer draft catch-up until
   // then, retaining this session's target hidden rows across interleaving.

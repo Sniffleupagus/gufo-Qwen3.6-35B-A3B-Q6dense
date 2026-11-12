@@ -66,7 +66,8 @@ public:
   }
 
   void Observe(std::size_t accepted, std::size_t drafted,
-               std::uint32_t context = 0) noexcept {
+               std::uint32_t context = 0,
+               bool recover_backoff = false) noexcept {
     if (drafted == 0)
       return;
     drafted = std::min<std::size_t>(drafted, limit_);
@@ -95,6 +96,12 @@ public:
       state_.failed_depths |= 1U << accepted;
     if (BestLength(limit_, context) == 0)
       state_.retry_tokens = 16;
+    else if (recover_backoff)
+      // A jointly planned greedy batch keeps drafting while this session's
+      // older AR backoff is active, and ObserveArToken never counts it down.
+      // Profitable new evidence supersedes that decision before the session
+      // decodes alone (upstream #912). Other callers keep the AR interval.
+      state_.retry_tokens = 0;
   }
 
   void ObserveArToken() noexcept {
