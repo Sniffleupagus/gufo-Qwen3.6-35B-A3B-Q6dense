@@ -186,9 +186,9 @@ struct TextRunnerDescriptor {
   /// Core preset kept for existing extensions.
   sampling::TextModelPreset sampling_preset{
       sampling::TextModelPreset::kUnspecified};
-  /// Prompt scheduling beside other sessions' decoding. Empty keeps passes
-  /// bounded by the host's decode-active budget.
-  std::optional<TextSchedulingProfile> scheduling{};
+  /// Prompt scheduling beside other sessions' decoding. Required: the host
+  /// rejects a runner that leaves `pass_tokens` (or any field) zero.
+  TextSchedulingProfile scheduling{};
 };
 
 struct TextRunnerResourceClaim {
@@ -277,12 +277,13 @@ public:
 
   virtual void SetCancellationCheck(const CancellationCheck&) {}
 
-  /// Set by the host for the next Prefill or PrefillThrough call only. A
-  /// runner whose descriptor has a scheduling profile splits each pass into
-  /// about `groups` layer groups of similar duration and calls YieldPrefill()
-  /// between them; it may add a boundary where the pass would otherwise
-  /// stall, such as a wait for input rows. Every layer keeps the arithmetic
-  /// of an unsplit pass. A runner may ignore it and run unsplit passes.
+  /// Set by the host for the next Prefill or PrefillThrough call only, with
+  /// `groups` up to the profile's `max_layer_groups`. The runner splits each
+  /// pass into about `groups` layer groups of similar duration and calls
+  /// YieldPrefill() between them; it may add a boundary where the pass would
+  /// otherwise stall, such as a wait for input rows. Every layer keeps the
+  /// arithmetic of an unsplit pass. A runner may ignore it and run unsplit
+  /// passes.
   /// While yielding, it must hold no lock or scratch its decode paths take.
   void SetPrefillYield(std::size_t groups, PrefillYield yield) {
     prefill_yield_groups_ = yield ? std::max<std::size_t>(groups, 1) : 1;
@@ -327,8 +328,13 @@ enum class InitialOutputState : std::uint8_t {
   kAuto,
   kThought,
   kText,
+  /// The prompt closed reasoning (for example, it ends in "<think></think>"):
+  /// output is text, and the host drops the separator before it as after a
+  /// close the model wrote.
+  kTextAfterThought,
   kReasoning = kThought,
   kContent = kText,
+  kContentAfterReasoning = kTextAfterThought,
 };
 
 enum class ChatRole : std::uint8_t {
@@ -555,6 +561,16 @@ public:
   /// after restoring rows into its slot at the given position.
   [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
   CreateComponentCacheResources(cache::ResourceLedger&, std::size_t) const = 0;
+  /// Actual serving-slot count, including typed callers. Providers may use it
+  /// to size eager transfer resources before slot construction/cache grants.
+  /// An unchanged provider retains its existing resource policy via fallback.
+  [[nodiscard]] virtual std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResourcesForSessions(cache::ResourceLedger& ledger,
+                                           std::size_t ram_bytes,
+                                           std::size_t sessions) const {
+    (void)sessions;
+    return CreateComponentCacheResources(ledger, ram_bytes);
+  }
   [[nodiscard]] virtual std::unique_ptr<TextRunnerState> BindComponentState(
       cache::Adapter&, cache::Slot&) const = 0;
   virtual void ReconcileComponentState(TextRunnerState&, std::size_t) const = 0;

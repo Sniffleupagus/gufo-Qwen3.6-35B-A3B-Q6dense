@@ -46,7 +46,7 @@ std::size_t CountReasoningTokens(
     const ext::ReasoningMarkup& reasoning,
     const std::function<std::string(tokenization::TokenId)>& decode) {
   using State = TextGenerationBackend::InitialOutputState;
-  if (initial == State::kContent || reasoning.close.empty() ||
+  if (TextGenerationBackend::IsContent(initial) || reasoning.close.empty() ||
       (initial == State::kAuto && reasoning.open.empty()))
     return 0;
   // The parsers match delimiters in text, and tokens at their edges can merge
@@ -202,7 +202,6 @@ InferenceBackend::~InferenceBackend() = default;
 #if defined(ENGINE_ENABLE_HIP)
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
                             std::string* error, std::size_t session_count,
-                            TextPrefillPolicy prefill_policy,
                             TextSchedulerPolicy scheduler_policy,
                             const TextDiskCacheConfig& disk_cache_config,
                             TextRunnerRamCacheOptions ram_cache_config) {
@@ -247,7 +246,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
         std::move(runner), session_count, std::move(runner_disk_cache),
         ram_cache_config);
     new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+        std::move(runner_pool), scheduler_policy);
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -266,7 +265,7 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner> runner,
 bool InferenceBackend::load(
     const std::string& model_path, std::string* error,
     std::uint32_t max_context, std::size_t session_count,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
+    TextSchedulerPolicy scheduler_policy,
     const TextSpeculativeConfig& speculative_config,
     const TextDiskCacheConfig& disk_cache_config,
     const std::string& vision_model_path,
@@ -309,12 +308,12 @@ bool InferenceBackend::load(
   if (runner == nullptr) {
     return false;
   }
-  return load(std::move(runner), error, session_count, prefill_policy,
-              scheduler_policy, disk_cache_config, ram_cache_config);
+  return load(std::move(runner), error, session_count, scheduler_policy,
+              disk_cache_config, ram_cache_config);
 }
 #else
 bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
-                            std::string* error, std::size_t, TextPrefillPolicy,
+                            std::string* error, std::size_t,
                             TextSchedulerPolicy, const TextDiskCacheConfig&,
                             TextRunnerRamCacheOptions) {
   SetError(error, "HIP engine is disabled");
@@ -322,8 +321,8 @@ bool InferenceBackend::load(std::shared_ptr<ext::TextModelRunner>,
 }
 
 bool InferenceBackend::load(const std::string&, std::string* error,
-                            std::uint32_t, std::size_t, TextPrefillPolicy,
-                            TextSchedulerPolicy, const TextSpeculativeConfig&,
+                            std::uint32_t, std::size_t, TextSchedulerPolicy,
+                            const TextSpeculativeConfig&,
                             const TextDiskCacheConfig&, const std::string&,
                             TextRunnerRamCacheOptions, bool,
                             const PrepareRunnerOptions&) {
@@ -595,7 +594,7 @@ InferenceBackend::Result InferenceBackend::chat(
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
   if (request.reasoning.budget_tokens &&
-      initial != TextGenerationBackend::InitialOutputState::kContent)
+      !TextGenerationBackend::IsContent(initial))
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens, initial);
@@ -686,7 +685,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   const auto initial =
       state->scheduler->runner().InitialOutputState(effective_request);
   if (request.reasoning.budget_tokens &&
-      initial != TextGenerationBackend::InitialOutputState::kContent)
+      !TextGenerationBackend::IsContent(initial))
     effective_sampling.reasoning_budget =
         state->scheduler->runner().BuildReasoningBudget(
             *request.reasoning.budget_tokens, prompt->tokens, initial);

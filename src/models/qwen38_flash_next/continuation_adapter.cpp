@@ -298,6 +298,13 @@ void ContinuationAdapter::PrefillThrough(
                                             next))
     throw std::runtime_error("component in-pass prefill failed: " + error);
 }
+std::optional<cache::CostEstimate> ContinuationAdapter::Cost() const {
+  // Fixed least-squares fit of the retained gfx1151 depth sweep; see this
+  // model's BENCHMARKS.md. Restore rates are shared measured hardware controls.
+  return mode_ == core::SessionMode::kSpeculative
+             ? cache::CostEstimate{0.000591766466, 0.000067029640, 96e9, 3.3e9}
+             : cache::CostEstimate{0.000573457239, 0.000058015348, 96e9, 3.3e9};
+}
 cache::Capabilities ContinuationAdapter::GetCapabilities() const {
   return {.continuation = true, .persistent_encoding = true};
 }
@@ -761,10 +768,13 @@ void ContinuationAdapter::CopyNativeKeys(
   copy(static_cast<__half*>(staging));
   const auto copied = hipMemcpyAsync(bytes.data(), staging, bytes.size(),
                                      hipMemcpyDeviceToHost, stream);
-  const auto settled = hipStreamSynchronize(stream);
+  // Only this transfer must settle before its staging allocation is freed.
+  // The native FIFO stream may also carry unrelated cache transfers.
+  const auto settled = transfer.Synchronize();
   (void)hipFree(staging);
   Check(copied);
-  Check(settled);
+  if (settled != TransferResult::kSucceeded)
+    throw std::runtime_error("Flash-Next key capture synchronization failed");
 }
 std::span<const std::byte> ContinuationAdapter::BorrowRowsView(
     const cache::Slot& slot, cache::ComponentId id, Rows first,

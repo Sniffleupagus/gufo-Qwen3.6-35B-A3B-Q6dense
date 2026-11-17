@@ -160,6 +160,13 @@ public:
   using InitialOutputState = gufo::ext::InitialOutputState;
   using ReasoningMarkup = gufo::ext::ReasoningMarkup;
 
+  /// Output that starts as content, after a reasoning block the prompt closed
+  /// or with no reasoning at all.
+  [[nodiscard]] static constexpr bool IsContent(InitialOutputState initial) {
+    return initial == InitialOutputState::kContent ||
+           initial == InitialOutputState::kContentAfterReasoning;
+  }
+
   struct SamplingDefaults {
     /// Zero means generate until EOS or the remaining context is exhausted.
     std::size_t max_tokens{0};
@@ -211,7 +218,6 @@ public:
     std::size_t max_prefill_layer_groups{1};
     /// Decode rounds other sessions ran between those groups.
     std::size_t prefill_yield_rounds{0};
-    std::size_t configured_active_prefill_tokens{0};
     std::size_t queue_depth_at_submit{0};
     std::size_t client_queue_depth_at_submit{0};
     std::size_t resident_requests_at_admission{0};

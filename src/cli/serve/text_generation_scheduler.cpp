@@ -122,6 +122,9 @@ struct ScheduledRequest {
   bool cache_prompt{true};
   bool cache_persist{true};
   std::size_t cache_prefix_tokens{0};
+  // Align the prompt to a live frontier when admitted (#1154); the value
+  // says whether a chat template trimmed reply whitespace.
+  std::optional<bool> align_frontier;
   bool stop_at_eos{true};
   std::size_t token_limit{1};
   std::size_t prompt_state_bytes{0};
@@ -548,6 +551,21 @@ void PrepareStructuredOutput(const TextModelRunner& runner) {
   Logger::Info("loader", line.str());
 }
 
+// Every text runner declares a scheduling profile; the policy rejects one
+// that does not.
+sched::Policy SchedulingPolicy(const std::shared_ptr<TextRunnerPool>& pool,
+                               const TextSchedulerPolicy& scheduler_policy) {
+  if (pool == nullptr) {
+    throw std::invalid_argument(
+        "text generation scheduler runner pool must not be null");
+  }
+  const auto descriptor = pool->runner().Descriptor();
+  return sched::Policy(
+      {.profile = descriptor.scheduling,
+       .incremental_prefill = descriptor.capabilities.incremental_prefill,
+       .unit_tokens = scheduler_policy.prefill_unit_tokens});
+}
+
 }  // namespace
 
 struct TextGenerationScheduler::Request::Impl {
@@ -562,11 +580,10 @@ struct TextGenerationScheduler::Request::Impl {
 
 struct TextGenerationScheduler::Impl {
   Impl(std::shared_ptr<TextRunnerPool> model_runner_pool,
-       TextPrefillPolicy model_prefill_policy,
        TextSchedulerPolicy model_scheduler_policy)
       : runner_pool(std::move(model_runner_pool)),
-        prefill_policy(model_prefill_policy),
         scheduler_policy(model_scheduler_policy),
+        policy(SchedulingPolicy(runner_pool, model_scheduler_policy)),
         output_budget(std::make_shared<OutputBudget>(
             model_scheduler_policy.max_buffered_output_bytes_total)) {
     if (runner_pool == nullptr) {
@@ -574,9 +591,7 @@ struct TextGenerationScheduler::Impl {
           "text generation scheduler runner pool must not be null");
     }
     sessions = std::make_shared<SessionTable>(runner_pool->capacity());
-    if (scheduler_policy.max_pending_requests == 0 ||
-        scheduler_policy.max_pending_requests_per_client == 0 ||
-        scheduler_policy.max_pending_requests_per_client >
+    if (scheduler_policy.max_pending_requests_per_client >
             scheduler_policy.max_pending_requests ||
         scheduler_policy.max_output_bytes_per_request == 0 ||
         scheduler_policy.max_buffered_output_bytes_per_request == 0 ||
@@ -587,10 +602,6 @@ struct TextGenerationScheduler::Impl {
     }
     incremental_prefill_supported =
         runner_pool->runner().Descriptor().capabilities.incremental_prefill;
-    policy = sched::Policy(
-        {.decode_active_tokens = prefill_policy.decode_active_tokens,
-         .incremental_prefill = incremental_prefill_supported,
-         .profile = runner_pool->runner().Descriptor().scheduling});
     final_token_advance_required =
         runner_pool->runner()
             .Descriptor()
@@ -722,6 +733,14 @@ struct TextGenerationScheduler::Impl {
             static_cast<std::int64_t>(queued_count),
         std::memory_order_relaxed);
     queued_count = count;
+  }
+
+  /// Sessions no admitted request holds. Lock order: queue_mutex, then
+  /// sessions->mutex, as in PopQueued.
+  [[nodiscard]] std::size_t FreeSessions() const {
+    const std::lock_guard<std::mutex> lock(sessions->mutex);
+    return static_cast<std::size_t>(std::count(
+        sessions->requests.begin(), sessions->requests.end(), nullptr));
   }
 
   [[nodiscard]] std::shared_ptr<ScheduledRequest> PopQueued() {
@@ -1125,6 +1144,23 @@ struct TextGenerationScheduler::Impl {
     return true;
   }
 
+  /// Aligns a replayed answer to the frontier that sampled it. Admission runs
+  /// after earlier requests on this scheduler committed their frontiers, so
+  /// an immediate retry after a cancelled stream sees the cancelled frontier
+  /// regardless of when its HTTP request arrived.
+  void AlignToLiveFrontier(ScheduledRequest& request) const {
+    const auto chat_template = std::exchange(request.align_frontier, {});
+    if (!chat_template ||
+        !runner_pool->AlignToLiveFrontier(
+            request.prompt, request.cache_prefix_tokens, *chat_template))
+      return;
+    // The aligned prompt stays below the context; keep its output room.
+    const auto context = runner_pool->runner().Descriptor().max_context;
+    request.result.prompt_tokens = request.prompt.size();
+    request.token_limit =
+        std::min(request.token_limit, context - request.prompt.size());
+  }
+
   /// A parked request resumes once its leader's checkpoint is retained, or
   /// once the leader can no longer publish it.
   [[nodiscard]] bool SharedPrefixSettled(
@@ -1244,6 +1280,7 @@ struct TextGenerationScheduler::Impl {
         if (CompleteIfStopped(request)) {
           continue;
         }
+        AlignToLiveFrontier(*request);
         if (WaitForSharedPrefix(request, residents, waiting.size())) {
           waiting.push_back(std::move(request));
           continue;
@@ -2019,7 +2056,14 @@ struct TextGenerationScheduler::Impl {
           request->decode_due = true;
           decoding.push_back(std::move(request));
         } else {
-          prefilling->push_back(std::move(request));
+          // A ready capture has already waited through its peer's turn.
+          // Preserve older waiters, but resume before the last peer repeats.
+          auto next = prefilling->end();
+          if (!prefilling->empty() &&
+              prefilling->back()->id == last_prefill_request_id) {
+            --next;
+          }
+          prefilling->insert(next, std::move(request));
         }
       }
     }
@@ -2220,7 +2264,6 @@ struct TextGenerationScheduler::Impl {
   }
 
   std::shared_ptr<TextRunnerPool> runner_pool;
-  TextPrefillPolicy prefill_policy;
   TextSchedulerPolicy scheduler_policy;
   sched::Policy policy;
   // Reused by every work-unit decision.
@@ -2297,6 +2340,13 @@ TextRequestPhase TextGenerationScheduler::Request::phase() const noexcept {
   return *this ? impl_->request->phase.load(std::memory_order_acquire)
                : TextRequestPhase::kTerminal;
 }
+
+#ifdef GUFO_CACHE_TESTING
+bool SnapshotPendingForTesting(
+    const TextGenerationScheduler::Request& request) {
+  return request && request.impl_->request->runner_request.SnapshotPending();
+}
+#endif
 
 TextGenerationScheduler::Result TextGenerationScheduler::Request::Wait(
     const TokenCallback& on_token, const ProgressCallback& on_progress,
@@ -2419,9 +2469,8 @@ void TextGenerationScheduler::Request::Cancel() noexcept {
 
 TextGenerationScheduler::TextGenerationScheduler(
     std::shared_ptr<TextRunnerPool> runner_pool,
-    TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy)
-    : impl_(std::make_unique<Impl>(std::move(runner_pool), prefill_policy,
-                                   scheduler_policy)) {}
+    TextSchedulerPolicy scheduler_policy)
+    : impl_(std::make_unique<Impl>(std::move(runner_pool), scheduler_policy)) {}
 
 TextGenerationScheduler::~TextGenerationScheduler() = default;
 
@@ -2488,13 +2537,6 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   if (prompt.empty()) {
     throw std::invalid_argument("text scheduler prompt must not be empty");
   }
-  // A client replays the previous answer as text, and the next prompt's
-  // tokenization of it need not match the sampled tokens (#1154). Comparing
-  // that text needs exact per-token decoding.
-  if (metadata.cache_prompt && metadata.prompt_context == nullptr &&
-      impl_->incremental_text_is_exact)
-    (void)impl_->runner_pool->AlignToLiveFrontier(
-        prompt, metadata.cache_prefix_tokens, metadata.chat_template);
   const auto context = impl_->runner_pool->runner().Descriptor().max_context;
   if (prompt.size() >= context) {
     throw std::length_error("prompt has " + std::to_string(prompt.size()) +
@@ -2531,8 +2573,6 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->result.prompt_tokens = prompt.size();
   request->result.token_metrics_recorded = true;
   request->result.client_id = request->client_id;
-  request->result.configured_active_prefill_tokens =
-      impl_->prefill_policy.decode_active_tokens;
   request->result.requested_logical_concurrency =
       impl_->runner_pool->capacity();
   request->result.execution_plan =
@@ -2542,6 +2582,12 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
   request->cache_prompt = metadata.cache_prompt;
   request->cache_persist = metadata.cache_persist;
   request->cache_prefix_tokens = metadata.cache_prefix_tokens;
+  // A client replays the previous answer as text, and the next prompt's
+  // tokenization of it need not match the sampled tokens (#1154). Comparing
+  // that text needs exact per-token decoding.
+  if (metadata.cache_prompt && request->prompt_context == nullptr &&
+      impl_->incremental_text_is_exact)
+    request->align_frontier = metadata.chat_template;
   request->stop_at_eos = metadata.stop_at_eos;
   request->token_limit =
       max_tokens > 0 ? std::min(max_tokens, available) : available;
@@ -2626,7 +2672,12 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
       throw TextGenerationError(TextGenerationErrorCode::kDeviceLost,
                                 kDeviceLostMessage);
     }
-    if (impl_->queued_count >= impl_->scheduler_policy.max_pending_requests) {
+    // Queued requests first claim the free sessions; only the rest wait, so
+    // only they count against the pending limits. `--max-pending 0` thus
+    // admits work for a free session and refuses everything else (#1206).
+    const std::size_t free_sessions = impl_->FreeSessions();
+    if (impl_->queued_count >=
+        impl_->scheduler_policy.max_pending_requests + free_sessions) {
       refused = true;
       refusal_code = TextGenerationErrorCode::kQueueFull;
       refusal_message = "text generation pending queue is full";
@@ -2638,15 +2689,17 @@ TextGenerationScheduler::Request TextGenerationScheduler::Submit(
           [&](const PendingClient& pending) {
             return pending.client_id == request->client_id;
           });
-      if (client != impl_->queued_clients.end() &&
-          client->requests.size() >=
-              impl_->scheduler_policy.max_pending_requests_per_client) {
+      const std::size_t client_queued =
+          client != impl_->queued_clients.end() ? client->requests.size() : 0;
+      if (client_queued >=
+          impl_->scheduler_policy.max_pending_requests_per_client +
+              free_sessions) {
         refused = true;
         refusal_code = TextGenerationErrorCode::kClientQueueFull;
         refusal_message = "text generation client pending queue is full";
         refusal_reason = "client_quota";
         decision_queued = impl_->queued_count;
-        decision_client_queued = client->requests.size();
+        decision_client_queued = client_queued;
       } else if (prompt_state_bytes.has_value() && !reserve_prompt()) {
         refused = true;
         refusal_code = TextGenerationErrorCode::kInsufficientMemory;
